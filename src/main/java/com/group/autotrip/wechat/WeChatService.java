@@ -13,8 +13,6 @@ import com.github.wechat.ilink.sdk.core.model.MessageItem;
 import com.github.wechat.ilink.sdk.core.model.VoiceItem;
 import com.github.wechat.ilink.sdk.core.model.WeixinMessage;
 import com.group.autotrip.agent.DashScopeService;
-import com.group.autotrip.agent.MessageRouter;
-import com.group.autotrip.tools.WeatherService;
 import jakarta.annotation.PreDestroy;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -35,21 +33,11 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 /**
- * 封装微信 iLink SDK：二维码登录、登录态本地持久化、自动接收消息、发送文本/图片消息。
+ * 封装微信 iLink SDK：二维码登录、登录态本地持久化、自动接收消息、发送文本消息。
  *
  * <p>登录后 SDK 心跳会按配置间隔自动调用 getUpdates 拉取消息，
- * 通过 onMessage 监听器回调。收到文本消息后异步调用阿里云百炼 LLM 自动回复：
- * <ul>
- *   <li>普通文本 —— 对话生成文本回复（sendText，已开启联网搜索）</li>
- *   <li>「画 xxx」或「图片 xxx」 —— 文生图后发送图片（sendImage）</li>
- *   <li>「说 xxx」或「语音 xxx」 —— TTS 生成 mp3 语音文件发送（sendFile）</li>
- *   <li>收到语音 —— 直接读取服务端转写的文字并回复</li>
- *   <li>收到图片 —— 用视觉模型识别后回复；若同一会话短时间内还收到一条文字
- *       （图文/文图），把文字作为意图与图片合并识别</li>
- * </ul>
- *
- *
- *
+ * 通过 onMessage 监听器回调。收到文本或语音（服务端已转写文字）消息后，
+ * 异步调用阿里云百炼 LLM 自动回复。
  */
 @Service
 public class WeChatService implements ApplicationRunner {
@@ -59,35 +47,7 @@ public class WeChatService implements ApplicationRunner {
     /** 内存中最多保留最近收到的消息条数 */
     private static final int MAX_RECEIVED_MESSAGES = 100;
 
-    /** 图文合并窗口：图片等待文字的最长时间（毫秒）。
-     *  需大于心跳轮询间隔（5000ms），才能覆盖"图片先到、文字下一次轮询才到"的跨批到达 */
-    private static final long IMAGE_WAIT_TEXT_WINDOW_MS = 8000;
-
-    /** 文图合并窗口：文字等待图片的最长时间（毫秒）。保持较短，避免拖慢普通聊天回复 */
-    private static final long TEXT_WAIT_IMAGE_WINDOW_MS = 2000;
-
-    /** 图文/文图配对器：把同一用户短时间内先后到达的图片和文字合并成一次视觉识别 */
-    private final ImageTextMerger imageTextMerger = new ImageTextMerger(
-            IMAGE_WAIT_TEXT_WINDOW_MS,
-            TEXT_WAIT_IMAGE_WINDOW_MS,
-            new ImageTextMerger.Handler() {
-                @Override
-                public void onImage(String fromUserId, MessageItem imageItem, String text) {
-                    if (text != null && !text.isBlank()) {
-                        log.info("图文/文图合并：from={}，文字意图={}", fromUserId, text);
-                    }
-                    replyImageAsync(fromUserId, imageItem, text);
-                }
-
-                @Override
-                public void onText(String fromUserId, String text) {
-                    replyAsync(fromUserId, text);
-                }
-            });
-
     private final DashScopeService dashScopeService;
-    private final WeatherService weatherService;
-    private final MessageRouter messageRouter;
     private final ObjectMapper stateMapper = new ObjectMapper();
     private final List<ReceivedMessage> receivedMessages = new CopyOnWriteArrayList<>();
     private final ExecutorService replyExecutor = Executors.newSingleThreadExecutor();
@@ -100,10 +60,8 @@ public class WeChatService implements ApplicationRunner {
 
     private volatile ILinkClient client;
 
-    public WeChatService(DashScopeService dashScopeService, WeatherService weatherService, MessageRouter messageRouter) {
+    public WeChatService(DashScopeService dashScopeService) {
         this.dashScopeService = dashScopeService;
-        this.weatherService = weatherService;
-        this.messageRouter = messageRouter;
     }
 
     /**
@@ -152,15 +110,9 @@ public class WeChatService implements ApplicationRunner {
                     for (WeixinMessage message : messages) {
                         ReceivedMessage received = ReceivedMessage.from(message);
                         batch.add(received);
-                        MessageItem imageItem = findImageItem(message);
-                        log.info("收到微信消息: from={}, 图片={}, 文字={}",
-                                received.fromUserId(), imageItem != null, received.text());
+                        log.info("收到微信消息: from={}, 文字={}",
+                                received.fromUserId(), received.text());
                         if (received.fromUserId() == null) {
-                            continue;
-                        }
-                        if (imageItem != null) {
-                            // 图片消息 —— 与文字（同一条消息或合并窗口内的另一条）合并后识别回复
-                            imageTextMerger.handleImage(received.fromUserId(), imageItem, findText(message));
                             continue;
                         }
                         VoiceItem voiceItem = findVoiceItem(message);
@@ -176,8 +128,7 @@ public class WeChatService implements ApplicationRunner {
                             continue;
                         }
                         if (received.text() != null && !received.text().isBlank()) {
-                            // 文本消息 —— 先进合并窗口等待可能紧随的图片（文图），超时按普通对话回复
-                            imageTextMerger.handleText(received.fromUserId(), received.text());
+                            replyAsync(received.fromUserId(), received.text());
                         }
                     }
                     receivedMessages.addAll(batch);
@@ -199,18 +150,6 @@ public class WeChatService implements ApplicationRunner {
         }
     }
 
-    private static MessageItem findImageItem(WeixinMessage message) {
-        if (message.getItem_list() == null) {
-            return null;
-        }
-        for (MessageItem item : message.getItem_list()) {
-            if (item.getImage_item() != null) {
-                return item;
-            }
-        }
-        return null;
-    }
-
     private static VoiceItem findVoiceItem(WeixinMessage message) {
         if (message.getItem_list() == null) {
             return null;
@@ -223,38 +162,7 @@ public class WeChatService implements ApplicationRunner {
         return null;
     }
 
-    private static String findText(WeixinMessage message) {
-        if (message.getItem_list() == null) {
-            return null;
-        }
-        for (MessageItem item : message.getItem_list()) {
-            if (item.getText_item() != null && item.getText_item().getText() != null) {
-                return item.getText_item().getText();
-            }
-        }
-        return null;
-    }
-
-    private void replyImageAsync(String toUserId, MessageItem imageItem, String prompt) {
-        replyExecutor.submit(() -> {
-            try {
-                requireClient();
-                byte[] imageBytes = client.downloadImageFromMessageItem(imageItem);
-                String description = dashScopeService.describeImage(
-                        imageBytes, "image.jpg",
-                        prompt == null || prompt.isBlank()
-                                ? "请详细描述这张图片的内容，如果图中有文字请一并识别出来"
-                                : prompt);
-                requireClient();
-                client.sendText(toUserId, description);
-                log.info("已向 {} 发送图片识别结果（{} 字节）", toUserId, imageBytes.length);
-            } catch (Exception e) {
-                log.error("图片识别回复失败: {}", e.getMessage(), e);
-                sendTextBestEffort(toUserId, "图片识别失败：" + e.getMessage());
-            }
-        });
-    }
-
+    /** 异步回复：消息按到达顺序逐个处理 */
     private void replyAsync(String toUserId, String text) {
         replyExecutor.submit(() -> {
             try {
@@ -266,47 +174,11 @@ public class WeChatService implements ApplicationRunner {
         });
     }
 
-    /**
-     * 三层消息路由回复：Skill 执行 → RAG 增强 → LLM 闲聊兜底。
-     * 路由细节见 {@link MessageRouter#route}。
-     */
     private void handleReply(String toUserId, String text) throws Exception {
-        MessageRouter.RouteResult route = messageRouter.route(toUserId, text);
-        DashScopeService.ChatResult result = route.result();
-        log.info("[回复] 层级={} 用户={}", route.tier(), toUserId);
-
-        if (result.wantsImage()) {
-            sendImageReply(toUserId, result.imagePrompt());
-        } else if (result.wantsSpeech()) {
-            sendVoiceReply(toUserId, result.speechText());
-        } else if (result.wantsWeather()) {
-            sendWeatherReply(toUserId, result.weatherLocation());
-        } else {
-            requireClient();
-            client.sendText(toUserId, result.text());
-            log.info("已向 {} 发送文本回复（层级={}）", toUserId, route.tier());
-        }
-    }
-
-    private void sendImageReply(String toUserId, String prompt) throws Exception {
-        DashScopeService.ImageResult image = dashScopeService.generateImage(prompt);
+        String reply = dashScopeService.chatOrGenerate(text).text();
         requireClient();
-        client.sendImage(toUserId, image.bytes(), image.fileName(), prompt);
-        log.info("已向 {} 发送文生图结果（{} 字节）", toUserId, image.bytes().length);
-    }
-
-    private void sendVoiceReply(String toUserId, String speech) throws Exception {
-        DashScopeService.VoiceResult voice = dashScopeService.synthesizeVoice(speech);
-        requireClient();
-        client.sendFile(toUserId, voice.bytes(), voice.fileName(), "语音回复");
-        log.info("已向 {} 发送语音文件（{} 字节）", toUserId, voice.bytes().length);
-    }
-
-    private void sendWeatherReply(String toUserId, String location) throws Exception {
-        WeatherService.WeatherInfo info = weatherService.getNowWeather(location);
-        requireClient();
-        client.sendText(toUserId, info.toString());
-        log.info("已向 {} 发送天气信息（{}）", toUserId, location);
+        client.sendText(toUserId, reply);
+        log.info("已向 {} 发送 LLM 文本回复", toUserId);
     }
 
     private void sendTextBestEffort(String toUserId, String text) {
@@ -487,7 +359,6 @@ public class WeChatService implements ApplicationRunner {
     @PreDestroy
     public void close() {
         saveState();
-        imageTextMerger.shutdown();
         replyExecutor.shutdownNow();
         ILinkClient c = client;
         if (c != null) {
