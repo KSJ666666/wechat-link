@@ -1,22 +1,38 @@
 # 12-group-project
 
-第 12 组微信机器人项目：微信自动收发消息 + 阿里云百炼（DashScope）大模型对话 + 联网搜索 + Function Calling 工具调用 + Skill 技能框架。
+第 12 组微信机器人项目：微信自动收发消息 + 阿里云百炼（DashScope）大模型对话 + 联网搜索 + Function Calling 工具调用 + Skill 技能框架，目前已完成天气和高德出行类工具。
 
 本文档覆盖当前代码库的实际功能、启动方式、使用注意事项，以及新增工具、新增 Skill 和团队协作规范。
 
 ## 目录
 
+- [当前进度](#当前进度)
 - [快速开始](#快速开始)
 - [微信登录与自测接口](#微信登录与自测接口)
 - [可用功能](#可用功能)
 - [消息处理流程](#消息处理流程)
 - [使用注意事项](#使用注意事项)
 - [配置说明](#配置说明)
+- [工具层](#工具层)
 - [新增工具](#新增工具)
 - [新增 Skill](#新增-skill)
+- [Skill 调用工具](#skill-调用工具)
 - [测试](#测试)
 - [项目结构](#项目结构)
 - [合作开发注意事项](#合作开发注意事项)
+
+## 当前进度
+
+| 模块 | 状态 | 说明 |
+| --- | --- | --- |
+| 微信接入 | 已完成 | 二维码登录、登录态持久化、文本 / 已转写语音自动回复 |
+| LLM 对话与联网搜索 | 已完成 | 阿里云百炼 `qwen-plus`，工具未命中时联网搜索兜底 |
+| Skill 技能框架 | 已完成 | 关键词调度框架可运行，当前仓库暂无内置 Skill 实现类 |
+| 天气工具 | 已完成 | 实时天气 `query_weather` + 未来天气预报 `query_weather_forecast` |
+| 高德地图工具 | 已完成 | POI 搜索、景点、路况、路线、距离矩阵 |
+| 出行推荐 | 已完成 | 综合距离、城市地铁、高峰时段和用户偏好推荐交通方式 |
+| 行程数据模型 | 进行中 | `Route` / `Itinerary` / `DayPlan` / `Spot` 已定义，完整行程生成流程尚未接入 |
+| 测试 | 已完成 | 当前 11 个测试用例全部通过，覆盖工具执行、路况和交通推荐 |
 
 ## 快速开始
 
@@ -24,15 +40,16 @@
 
 - JDK 21
 - Maven 3.9+（也可以直接使用项目自带的 Maven Wrapper）
-- 可访问外网（调用阿里云百炼、心知天气和微信 SDK 服务）
+- 可访问外网（调用阿里云百炼、心知天气、高德地图和微信 SDK 服务）
 
 ### 配置环境变量
 
-启动前需要配置两个 API Key：
+启动前需要配置三个 API Key：
 
 ```powershell
 setx DASHSCOPE_API_KEY "你的阿里云百炼密钥"
 setx WEATHER_API_KEY "你的心知天气密钥"
+setx AMAP_API_KEY "你的高德 Web 服务密钥"
 ```
 
 `setx` 设置的变量需要新开一个终端才会生效。只想在当前终端临时使用，可以改为：
@@ -40,9 +57,10 @@ setx WEATHER_API_KEY "你的心知天气密钥"
 ```powershell
 $env:DASHSCOPE_API_KEY = "你的阿里云百炼密钥"
 $env:WEATHER_API_KEY = "你的心知天气密钥"
+$env:AMAP_API_KEY = "你的高德 Web 服务密钥"
 ```
 
-`DASHSCOPE_API_KEY` 在[阿里云百炼控制台](https://bailian.console.aliyun.com/)创建；`WEATHER_API_KEY` 在[心知天气控制台](https://www.seniverse.com/)创建。
+`DASHSCOPE_API_KEY` 在[阿里云百炼控制台](https://bailian.console.aliyun.com/)创建；`WEATHER_API_KEY` 在[心知天气控制台](https://www.seniverse.com/)创建；`AMAP_API_KEY` 在[高德开放平台](https://console.amap.com/)创建。
 
 > 密钥只放到环境变量或本地配置文件里，不要提交到 Git，也不要发到群里。
 
@@ -86,7 +104,13 @@ mvn spring-boot:run
 | 微信自动回复 | 接收文本消息，以及服务端已转写文字的语音消息，自动调用 LLM 回复 |
 | LLM 对话 | 使用 `qwen-plus` 模型进行文本对话 |
 | 联网搜索 | 工具无法回答时自动联网搜索兜底，命中实时类关键词时优先搜索 |
-| 天气查询 | 通过 `query_weather` 工具调用心知天气接口，返回具体城市的实时天气 |
+| 实时天气 | `query_weather`：查询具体城市的当前天气 |
+| 天气预报 | `query_weather_forecast`：查询未来 1-15 天预报，默认 3 天 |
+| 地点搜索 | `search_poi`：搜索餐厅、酒店、景点、商场等地点 |
+| 景点查询 | `query_attractions` 查询景点列表，`query_attraction_detail` 查询评分、开放时间等详情 |
+| 实时路况 | `query_traffic`：查询某城市某条道路的拥堵情况 |
+| 出行路线 | `query_route`：查询两地点间的步行、公交、地铁、驾车、高铁方案并给出推荐 |
+| 距离比较 | `query_distance_matrix`：一次计算一个起点到多个目的地的距离和耗时 |
 | Function Calling | 模型可自动调用已注册工具，支持一轮多工具并行或串行执行 |
 | Skill 技能 | 关键词命中的技能直接执行，不依赖模型自行判断；当前已具备框架，可继续添加技能 |
 | 开发自测接口 | `/wechat/llm/chat` 等接口可在不登录微信时验证 LLM 和工具链路 |
@@ -103,15 +127,17 @@ mvn spring-boot:run
 
 ## 使用注意事项
 
-- 未配置 `DASHSCOPE_API_KEY` 时，LLM 调用会报“未配置阿里云百炼 API Key”；未配置 `WEATHER_API_KEY` 时，天气工具会执行失败。
-- 天气查询只支持具体城市（如“郑州”“上海”或拼音 `zhengzhou`），不支持省份、自治区等省级区域；用户问“河南天气”时，机器人会提示提供具体城市名。
+- 未配置 `DASHSCOPE_API_KEY` 时，LLM 调用会报“未配置阿里云百炼 API Key”；未配置 `WEATHER_API_KEY` 时，天气工具会执行失败；未配置 `AMAP_API_KEY` 时，POI、景点、路况、路线、距离矩阵工具会执行失败。
+- 天气工具只支持具体城市（如“郑州”“上海”或拼音 `zhengzhou`），不支持省份、自治区等省级区域；用户问“河南天气”时，机器人会提示提供具体城市名。地点搜索建议携带城市，未提供城市时可能在全国范围搜索。
 - 当前代码未内置多轮对话记忆，每次微信消息都是独立调用 LLM；重启后内存中的消息记录也会清空。
 - 微信语音消息依赖服务端把语音转成文字；如果 SDK 未返回转写文字，则不会回复。
 - `/wechat/send` 只能给“曾经给 bot 发过消息且已被 SDK 拉取过会话上下文”的用户发送，否则会缺少 contextToken。
 - 微信登录态保存在 `~/.wechat-demo-resume.json`，包含会话凭据，不要提交或分享；登录态失效时会自动删除并重新扫码。
 - 消息回复是单线程顺序处理的，LLM 较慢时新消息会排队等待，不会并发回复同一用户。
 - 工具默认并行执行（`dashscope.tool-execution-mode=parallel`），多工具同时调用外部接口时要注意第三方 API 限流；需要严格串行时可改为 `serial`。
-- 一次消息最多执行 5 轮工具调用，超过后会报错退出。
+- 一次消息最多执行 12 轮工具调用（`dashscope.tool-execution-max-rounds` 可调），达到上限后会自动让模型基于已有结果收尾。
+- 高德 Web 服务有并发和每日配额限制，代码内已限制最多 2 个并发请求并在限流时重试一次，但高频使用仍可能触发配额耗尽。
+- 交通推荐依赖 `cities-transport.json` 中的城市地铁 / 铁路档案；未收录的城市仍可查询，但无法判断是否通地铁。
 - 联网搜索和模型调用会产生 API 费用，长时间运行或高频测试前先确认额度。
 - REST 接口没有鉴权，只适合本机或内网开发调试，不要直接暴露到公网。
 - Windows 控制台中文乱码时，可用 Windows Terminal，或在启动前执行 `chcp 65001`。
@@ -124,15 +150,47 @@ mvn spring-boot:run
 | --- | --- | --- |
 | `dashscope.api-key` | `${DASHSCOPE_API_KEY:}` | 阿里云百炼 API Key |
 | `weather.api-key` | `${WEATHER_API_KEY:}` | 心知天气 API Key |
+| `amap.api-key` | `${AMAP_API_KEY:}` | 高德开放平台 Web 服务 API Key |
 | `dashscope.chat-model` | `qwen-plus` | 对话模型 |
 | `dashscope.tool-execution-mode` | `parallel` | 工具执行模式：`serial` 或 `parallel` |
 | `dashscope.tool-execution-threads` | `4` | 并行模式下工具执行线程数 |
+| `dashscope.tool-execution-max-rounds` | `12` | 单次消息最多工具调用轮数 |
 | `dashscope.enable-search` | `true` | 是否开启联网搜索兜底 |
 | `dashscope.forced-search` | `true` | 命中实时类关键词后是否强制搜索 |
 | `dashscope.search-extension` | `true` | 是否启用垂域搜索 |
 | `wechat.auto-login` | `true` | 启动时自动恢复登录态或打印二维码 |
 | `wechat.resume-file` | `${user.home}/.wechat-demo-resume.json` | 微信登录态保存位置 |
 | `logging.charset.console` | `UTF-8` | 控制台日志编码 |
+
+## 工具层
+
+工具层由以下几个部分组成：
+
+| 组件 | 类 | 作用 |
+| --- | --- | --- |
+| 工具接口 | `com.group.autotrip.common.FunctionTool` | 定义工具的名称、描述、参数 Schema 和执行方法 |
+| 工具注册表 | `com.group.autotrip.tools.CustomTools` | Spring 自动收集所有 `@Component` 的 `FunctionTool`，按工具名分发执行 |
+| 工具执行入口 | `com.group.autotrip.agent.DashScopeService` | 把已注册工具列表交给模型，模型请求后调用 `CustomTools.execute()` |
+| 外部数据服务 | `WeatherService`、`AmapService` | 封装心知天气和高德 Web API，供具体工具调用 |
+| 城市交通档案 | `CityTransportSupport` | 启动时读取 `cities-transport.json`，提供城市 adcode、地铁 / 铁路能力 |
+| 出行推荐器 | `TransportRecommender` | 综合距离、是否同城、城市地铁、高峰时段和用户偏好生成推荐 |
+
+当前已注册工具：
+
+| 工具名 | 实现类 | 功能 | 参数 |
+| --- | --- | --- | --- |
+| `query_weather` | `QueryWeatherTool` | 查询具体城市的实时天气 | `location`：城市中文名、拼音、城市 ID 或经纬度 |
+| `query_weather_forecast` | `QueryWeatherForecastTool` | 查询未来 1-15 天天气预报，默认 3 天 | `location`；可选 `days` |
+| `search_poi` | `SearchPoiTool` | 按关键词搜索餐厅、酒店、景点、商场等地点 | `keywords`；可选 `city`、`limit` |
+| `query_attractions` | `QueryAttractionsTool` | 查询城市景点 / 景区列表 | `city`；可选 `keyword`、`limit` |
+| `query_attraction_detail` | `QueryAttractionDetailTool` | 查询单个景点的评分、等级、开放时间、电话、地址 | `city`、`name` |
+| `query_traffic` | `QueryTrafficTool` | 查询某条道路的实时拥堵情况 | `city`、`road` |
+| `query_route` | `QueryRouteTool` | 查询两地间多种交通方式并给出推荐 | `origin`、`destination`；可选 `city`、`originCity`、`destinationCity`、`mode`、`prefer` |
+| `query_distance_matrix` | `QueryDistanceMatrixTool` | 一次计算起点到多个目的地的距离和耗时并排序 | `origin`、`destinations`；可选 `city`、`mode` |
+
+`CustomTools.execute("工具名", JsonNode 参数)` 会按名称找到工具并执行，返回给模型的必须是字符串。工具名重复时 Spring 启动会直接报“工具名冲突”。
+
+工具既能被模型通过 Function Calling 自动调用，也能被 Skill 在 `execute()` 中主动调用。
 
 ## 新增工具
 
@@ -242,13 +300,41 @@ public class ExampleSkill implements Skill {
 
 Skill 会在工具调用和 LLM 兜底之前执行，适合做固定流程、固定回复或需要确定性结果的场景。
 
+### Skill 调用工具
+
+在 Skill 的 `execute()` 中，通过 `ctx.tools().execute(工具名, 参数)` 调用已注册工具：
+
+```java
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+
+@Override
+public String execute(String userText, SkillContext ctx) throws Exception {
+    ObjectNode args = new ObjectMapper().createObjectNode();
+    args.put("location", "郑州");
+
+    try {
+        return ctx.tools().execute("query_weather", args);
+    } catch (Exception e) {
+        return "天气查询失败：" + e.getMessage();
+    }
+}
+```
+
+说明：
+
+- `ctx.tools()` 返回工具注册表 `CustomTools`，可以直接按工具名调用任意已注册工具。
+- 参数必须是 `JsonNode`，通常用 `ObjectNode` 构造 JSON 对象。
+- 工具返回的是文本字符串，可以直接作为 Skill 的回复内容。
+- 工具名不存在时会抛 `未知工具` 异常，建议在 Skill 内捕获并转成用户可读的提示。
+
 ## 测试
 
 ```powershell
 mvn test
 ```
 
-当前测试覆盖 Spring 上下文加载和工具串行 / 并行执行，不需要真实 API Key。
+当前测试覆盖 Spring 上下文加载、工具串行 / 并行执行、实时路况工具和交通出行推荐，共 11 个用例，不需要真实 API Key。
 
 使用 Maven Wrapper 时执行：
 
@@ -264,7 +350,8 @@ src/main/java/com/group/autotrip/
 ├── agent/
 │   └── DashScopeService.java    LLM 对话、联网搜索、工具调用与多轮闭环
 ├── common/
-│   └── FunctionTool.java        工具接口
+│   ├── FunctionTool.java        工具接口
+│   └── model/                   Route / Itinerary / DayPlan / Spot / RouteOption / TransportMode
 ├── skill/
 │   ├── Skill.java               Skill 接口
 │   ├── SkillContext.java        Skill 执行上下文
@@ -273,11 +360,24 @@ src/main/java/com/group/autotrip/
 ├── tools/
 │   ├── CustomTools.java         工具注册与分发
 │   ├── QueryWeatherTool.java    天气查询工具
-│   └── WeatherService.java      心知天气 HTTP 服务
+│   ├── QueryWeatherForecastTool.java  天气预报工具
+│   ├── WeatherService.java      心知天气 HTTP 服务
+│   ├── AmapService.java         高德 Web API 封装
+│   ├── SearchPoiTool.java       地点搜索工具
+│   ├── QueryAttractionsTool.java 景点列表工具
+│   ├── QueryAttractionDetailTool.java 景点详情工具
+│   ├── QueryTrafficTool.java    实时路况工具
+│   ├── QueryRouteTool.java      出行路线工具
+│   ├── QueryDistanceMatrixTool.java 距离矩阵工具
+│   ├── CityTransportSupport.java 城市交通档案
+│   └── TransportRecommender.java 出行方式推荐
 └── wechat/
     ├── WeChatController.java    微信 REST 接口
     ├── WeChatService.java       微信登录、收发消息、自动回复
     └── ...                      消息与登录态相关数据结构
+
+src/main/resources/
+└── cities-transport.json         城市地铁 / 铁路能力与 adcode 档案
 ```
 
 ## 合作开发注意事项
@@ -290,6 +390,5 @@ src/main/java/com/group/autotrip/
 - 不要提交 `target/`、`.idea/`、`.codegraph/`、微信登录态文件或任何 API Key。
 - 新增工具或 Skill 时优先只增加新类，不要改动 `CustomTools`、`SkillRegistry`、`SkillDispatcher` 等公共注册代码，减少合并冲突。
 - 尽量按模块拆分工作，避免多人同时修改同一个文件；必须共改时先和负责该模块的成员沟通。
-- 推送前运行 `.\mvnw.cmd test`，确保测试通过。
+- 推送前运行 `mvn test`，确保测试通过。
 - 新增功能后同步更新本文档的功能列表和配置说明。
-

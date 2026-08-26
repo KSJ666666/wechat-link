@@ -88,6 +88,9 @@ public class DashScopeService {
     @Value("${dashscope.search-extension:true}")
     private boolean searchExtension;
 
+    @Value("${dashscope.tool-execution-max-rounds:12}")
+    private int maxToolRounds;
+
     /** 文本对话，返回模型回复内容 */
     public String chat(String userText) throws IOException {
         requireKey();
@@ -160,7 +163,7 @@ public class DashScopeService {
         }
 
         // ===== 有工具调用 = 多轮闭环（全程不联网搜索） =====
-        for (int round = 1; round <= 5; round++) {
+        for (int round = 1; round <= maxToolRounds; round++) {
             JsonNode message;
             if (round == 1) {
                 message = firstMessage;   // 复用第一阶段结果，避免重复请求
@@ -186,7 +189,19 @@ public class DashScopeService {
             assistant.set("tool_calls", toolCalls);
             appendToolResults(messages, toolCalls);
         }
-        throw new IOException("工具调用超过 5 轮仍未得到最终回复");
+
+        // ===== 达到最大轮数仍未结束 =====
+        // 追加一条强制收尾消息，让模型基于已有工具结果直接总结，避免回复失败。
+        ObjectNode finalize = messages.addObject();
+        finalize.put("role", "user");
+        finalize.put("content", "工具调用已结束，请基于已有工具结果直接生成最终回复，不要再调用工具。");
+        JsonNode finalResp = postJson(CHAT_URL, body);
+        JsonNode finalMessage = finalResp.path("choices").path(0).path("message");
+        String finalReply = finalMessage.path("content").asText("");
+        if (finalReply.isEmpty()) {
+            throw new IOException("对话返回为空");
+        }
+        return new ChatResult(finalReply);
     }
 
     /** 组装 system + user 两条消息（工具优先的系统提示） */
@@ -198,6 +213,7 @@ public class DashScopeService {
                         + "不要自己编造天气。"
                         + toolRules()
                         + "只要问题能通过上述工具解决，就必须调用对应工具，禁止直接凭训练知识回答或编造数据。"
+                        + "信息足够后必须直接生成最终回答，不要继续调用工具；同一轮内可以并行调用多个工具。"
                         + "注意：如果用户询问的是省份、自治区等省级区域（如'河南天气'、'广东省天气'）的天气，不要调用 query_weather 工具，"
                         + "而应提示用户：该查询仅支持具体城市，请提供具体的城市名称（如'郑州'、'广州'）。"
                         + "其他无法用工具回答的问题，系统会自动联网搜索。");

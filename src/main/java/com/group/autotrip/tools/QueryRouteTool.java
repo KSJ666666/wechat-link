@@ -4,18 +4,21 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.group.autotrip.common.FunctionTool;
+import com.group.autotrip.common.model.RouteOption;
 import org.springframework.stereotype.Component;
 
-/** 计算两个地点之间的驾车路线。 */
+import java.util.Locale;
+
+/** 查询两个地点之间的多种交通方式并给出出行推荐。 */
 @Component
 public class QueryRouteTool implements FunctionTool {
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
-    private final AmapService amapService;
+    private final TransportRecommender transportRecommender;
 
-    public QueryRouteTool(AmapService amapService) {
-        this.amapService = amapService;
+    public QueryRouteTool(TransportRecommender transportRecommender) {
+        this.transportRecommender = transportRecommender;
     }
 
     @Override
@@ -25,8 +28,9 @@ public class QueryRouteTool implements FunctionTool {
 
     @Override
     public String description() {
-        return "计算两个地点之间的驾车路线（距离、预计耗时、过路费），用于串联行程和安排一日游路线。"
-                + "当用户需要知道'从A到B怎么走、多远、开车多久'、要规划景点先后顺序时调用。";
+        return "查询两个地点之间的交通方式和出行推荐（步行、公交、地铁、驾车、高铁/火车）。"
+                + "根据距离、城市是否有地铁、是否高峰期和用户偏好自动推荐最合适的交通方式，"
+                + "当用户需要知道'从A到B怎么走、多远、多久'、想比较交通方式或安排一日游路线时调用。";
     }
 
     @Override
@@ -42,7 +46,19 @@ public class QueryRouteTool implements FunctionTool {
                 .put("description", "终点地点（必填，如：北京故宫博物院、杭州灵隐寺）");
         props.putObject("city")
                 .put("type", "string")
-                .put("description", "两个地点所在城市（可选，用于准确定位，如：北京）");
+                .put("description", "两个地点所在城市（可选，用于准确定位，如：北京；跨城时建议使用 originCity 和 destinationCity）");
+        props.putObject("originCity")
+                .put("type", "string")
+                .put("description", "起点所在城市（可选，跨城查询时建议填写，如：北京）");
+        props.putObject("destinationCity")
+                .put("type", "string")
+                .put("description", "终点所在城市（可选，跨城查询时建议填写，如：上海）");
+        props.putObject("mode")
+                .put("type", "string")
+                .put("description", "交通方式（可选）：all=自动推荐（默认），walking=步行，bus=公交，metro=地铁，driving=驾车，rail=高铁/火车");
+        props.putObject("prefer")
+                .put("type", "string")
+                .put("description", "用户偏好（可选）：walking、bus、metro、driving、avoid_driving（不想开车）");
         p.putArray("required").add("origin").add("destination");
         p.put("additionalProperties", false);
         return p;
@@ -53,9 +69,64 @@ public class QueryRouteTool implements FunctionTool {
         String origin = args.path("origin").asText("");
         String destination = args.path("destination").asText("");
         String city = args.path("city").asText("");
+        String originCity = args.path("originCity").asText("");
+        String destinationCity = args.path("destinationCity").asText("");
+        String mode = args.path("mode").asText("");
+        String prefer = args.path("prefer").asText("");
         if (origin.isBlank() || destination.isBlank()) {
             throw new IllegalArgumentException("origin 和 destination 参数不能为空");
         }
-        return amapService.getDrivingRoute(origin, destination, city).toString();
+        if (originCity.isBlank()) {
+            originCity = city;
+        }
+        if (destinationCity.isBlank()) {
+            destinationCity = city;
+        }
+        return format(transportRecommender.recommend(
+                origin, destination, originCity, destinationCity, mode, prefer));
+    }
+
+    private String format(TransportRecommender.Recommendation recommendation) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("从 ").append(recommendation.originName())
+                .append(" → ").append(recommendation.destinationName())
+                .append("（").append(recommendation.sameCity() ? "同城" : "跨城");
+        if (recommendation.baselineDistanceMeters() > 0) {
+            sb.append("，约 ").append(formatKm(recommendation.baselineDistanceMeters())).append(" 公里");
+        }
+        sb.append("）\n");
+        sb.append("推荐：").append(formatOption(recommendation.recommended()));
+        if (!recommendation.reason().isBlank()) {
+            sb.append("\n推荐理由：").append(recommendation.reason());
+        }
+        if (!recommendation.alternatives().isEmpty()) {
+            sb.append("\n备选：");
+            for (int i = 0; i < recommendation.alternatives().size(); i++) {
+                if (i > 0) {
+                    sb.append("、");
+                }
+                sb.append(formatOption(recommendation.alternatives().get(i)));
+            }
+        }
+        return sb.toString();
+    }
+
+    private String formatOption(RouteOption option) {
+        String summary = option.summary().isBlank() ? option.mode().displayName() : option.summary();
+        StringBuilder sb = new StringBuilder(summary);
+        sb.append("（约 ").append((int) Math.ceil(option.durationSeconds() / 60.0)).append(" 分钟");
+        if (!option.cost().isBlank() && !"0".equals(option.cost())) {
+            sb.append("，费用 ").append(option.cost()).append(" 元");
+        }
+        sb.append("）");
+        return sb.toString();
+    }
+
+    private static String formatKm(long meters) {
+        double km = meters / 1000.0;
+        if (km < 10) {
+            return String.format(Locale.ROOT, "%.1f", km);
+        }
+        return String.valueOf(Math.round(km));
     }
 }
