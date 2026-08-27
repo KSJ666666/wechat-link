@@ -11,6 +11,8 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -29,6 +31,7 @@ public class WeatherService {
     private static final Logger log = LoggerFactory.getLogger(WeatherService.class);
 
     private static final String NOW_URL = "https://api.seniverse.com/v3/weather/now.json";
+    private static final String DAILY_URL = "https://api.seniverse.com/v3/weather/daily.json";
 
     private final ObjectMapper mapper = new ObjectMapper();
     private final OkHttpClient http = new OkHttpClient.Builder()
@@ -78,6 +81,41 @@ public class WeatherService {
         );
     }
 
+    public List<DailyForecast> getDailyWeather(String location, int days) throws IOException {
+        requireKey();
+        String url = DAILY_URL + "?key=" + apiKey
+                + "&location=" + location
+                + "&language=" + language
+                + "&unit=" + unit
+                + "&days=" + Math.min(Math.max(days, 1), 15);
+
+        JsonNode resp = getJson(url);
+        JsonNode results = resp.path("results");
+        if (!results.isArray() || results.isEmpty()) {
+            throw new IOException("天气接口返回为空: " + resp);
+        }
+
+        JsonNode result = results.get(0);
+        JsonNode loc = result.path("location");
+        JsonNode daily = result.path("daily");
+        if (!daily.isArray() || daily.isEmpty()) {
+            throw new IOException("天气预报接口返回为空: " + resp);
+        }
+
+        List<DailyForecast> forecasts = new ArrayList<>();
+        for (JsonNode day : daily) {
+            forecasts.add(new DailyForecast(
+                    loc.path("name").asText(""),
+                    day.path("date").asText(""),
+                    day.path("text_day").asText(""),
+                    day.path("text_night").asText(""),
+                    day.path("high").asText(""),
+                    day.path("low").asText("")
+            ));
+        }
+        return forecasts;
+    }
+
     private void requireKey() {
         if (apiKey == null || apiKey.isBlank()) {
             throw new IllegalStateException();
@@ -111,6 +149,21 @@ public class WeatherService {
         public String toString() {
             return String.format("%s 天气：%s，温度：%s°C（更新时间：%s）",
                     city, text, temperature, lastUpdate);
+        }
+    }
+
+    public record DailyForecast(
+            String city,
+            String date,
+            String textDay,
+            String textNight,
+            String high,
+            String low
+    ) {
+        @Override
+        public String toString() {
+            return String.format("%s %s：%s转%s，最高%s°C，最低%s°C",
+                    city, date, textDay, textNight, high, low);
         }
     }
 }

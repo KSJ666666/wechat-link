@@ -89,6 +89,7 @@ mvn spring-boot:run
 | 天气查询 | 通过 `query_weather` 工具调用心知天气接口，返回具体城市的实时天气 |
 | Function Calling | 模型可自动调用已注册工具，支持一轮多工具并行或串行执行 |
 | Skill 技能 | 关键词命中的技能直接执行，不依赖模型自行判断；当前已具备框架，可继续添加技能 |
+| 旅行规划 Skill | 命中明确的自驾旅行需求时，会串联路线、景点、距离和天气工具生成路书 |
 | 开发自测接口 | `/wechat/llm/chat` 等接口可在不登录微信时验证 LLM 和工具链路 |
 
 ## 消息处理流程
@@ -124,6 +125,7 @@ mvn spring-boot:run
 | --- | --- | --- |
 | `dashscope.api-key` | `${DASHSCOPE_API_KEY:}` | 阿里云百炼 API Key |
 | `weather.api-key` | `${WEATHER_API_KEY:}` | 心知天气 API Key |
+| `amap.api-key` | `${AMAP_API_KEY:}` | 高德地图 Web Service API Key |
 | `dashscope.chat-model` | `qwen-plus` | 对话模型 |
 | `dashscope.tool-execution-mode` | `parallel` | 工具执行模式：`serial` 或 `parallel` |
 | `dashscope.tool-execution-threads` | `4` | 并行模式下工具执行线程数 |
@@ -207,6 +209,8 @@ public class ExampleTool implements FunctionTool {
 4. `name()` 在所有 Skill 中全局唯一。
 5. `supports()` 用关键词判断是否由本 Skill 处理；`SkillDispatcher` 按注册顺序匹配，命中第一个就执行，因此关键词不要写得过于宽泛。
 6. 在 `execute()` 中可以通过 `ctx.userText()` 取用户消息，通过 `ctx.tools()` 调用工具，通过 `ctx.llm()` 调用 LLM。
+
+当前仓库中的旅行规划 Skill 会先解析出发地、目的地、天数和偏好，再串联 `query_weather`、`query_weather_forecast`、`query_route`、`query_attractions`、`query_attraction_detail`、`query_distance_matrix`、`search_poi` 和 `query_traffic`，最后交给 `ctx.llm()` 组织成适合直接发送的路书。
 
 示例：
 
