@@ -27,13 +27,14 @@
 | --- | --- | --- |
 | 微信接入 | 已完成 | 二维码登录、登录态持久化、文本 / 已转写语音自动回复 |
 | LLM 对话与联网搜索 | 已完成 | 阿里云百炼 `qwen-plus`，工具未命中时联网搜索兜底 |
-| Skill 技能框架 | 已完成 | 关键词调度框架可运行，当前仓库暂无内置 Skill 实现类 |
+| Skill 技能框架 | 已完成 | 关键词调度框架可运行，已内置“行程护航”技能 |
 | 天气工具 | 已完成 | 实时天气 `query_weather` + 未来天气预报 `query_weather_forecast` |
 | 高德地图工具 | 已完成 | POI 搜索、景点、路况、路线、距离矩阵 |
 | 出行推荐 | 已完成 | 综合距离、城市地铁、高峰时段和用户偏好推荐交通方式 |
 | 景点指南 RAG 检索 | 已完成 | 指南 JSON 清洗 → 切分 → 阿里云嵌入向量化 → Milvus + VSM 混合检索 → 重排 → LLM 生成 |
+| 行程护航（定时监控） | 已完成 | 注册监控 → 定时巡检 → LLM 判断规则 → 触发时微信主动推送告警 |
 | 行程数据模型 | 进行中 | `Route` / `Itinerary` / `DayPlan` / `Spot` 已定义，完整行程生成流程尚未接入 |
-| 测试 | 已完成 | 当前 29 个测试用例全部通过，覆盖工具执行、路况、交通推荐与 RAG 清洗/切分/检索/重排 |
+| 测试 | 已完成 | 当前 42 个测试用例全部通过，覆盖工具执行、路况、交通推荐、RAG 检索与行程护航 |
 
 ## 快速开始
 
@@ -114,8 +115,10 @@ mvn spring-boot:run
 | 距离比较 | `query_distance_matrix`：一次计算一个起点到多个目的地的距离和耗时 |
 | 景点指南检索 | `query_guide_rag`：基于本地知识库（大理/杭州/上海/长沙景点指南）的 RAG 问答，向量 + 关键词混合检索、重排后由大模型生成带来源的答案 |
 | Function Calling | 模型可自动调用已注册工具，支持一轮多工具并行或串行执行 |
-| Skill 技能 | 关键词命中的技能直接执行，不依赖模型自行判断；当前已具备框架，可继续添加技能 |
+<<<<<<< Updated upstream
+| Skill 技能 | 关键词命中的技能直接执行，不依赖模型自行判断；已内置“旅行规划”“行程护航”技能，可继续添加 |
 | 旅行规划 Skill | 命中明确的自驾旅行需求时，会串联路线、景点、距离和天气工具，生成适合直接发送的路书 |
+| 行程护航 | 发送“监控郑州天气，低于0度就提醒我”开启监控；机器人定时巡检，规则触发时主动推送告警；“查看监控”“取消监控”管理 |
 | 开发自测接口 | `/wechat/llm/chat` 等接口可在不登录微信时验证 LLM 和工具链路 |
 
 ## 消息处理流程
@@ -144,6 +147,9 @@ mvn spring-boot:run
 - 景点指南 RAG 检索依赖本机 Milvus 容器（`localhost:19530`）和 `DASHSCOPE_API_KEY`；Milvus 不可用或嵌入失败时自动降级为纯关键词检索，不影响其他功能。
 - 启动时会自动重建 RAG 索引（清洗 → 切分 → 向量化 → 写入 Milvus，40 个景点一般十几秒完成）；知识块持久化在 Milvus，内存 VSM 关键词索引重启后重建。
 - 微信端询问大理 / 杭州 / 上海 / 长沙景点时模型会调用 `query_guide_rag`，链路含嵌入、检索、重排和 LLM 生成，回复会比普通消息慢几秒。
+- 行程护航监控保存在内存中，重启后清空；告警推送需要微信已登录且目标用户有有效会话上下文，推送失败只记日志。
+- 每条监控每次巡检消耗 1 次工具调用 + 1 次 LLM 判断（默认 30 分钟一轮，费用可忽略）；规则触发判断依赖 LLM，解析不出结果时按不触发处理（宁可不打扰）。
+- 预算类监控依赖行程规划功能，暂未开放；天气监控只支持具体城市，路况监控注册时请写成“城市 道路”格式。
 - 联网搜索和模型调用会产生 API 费用，长时间运行或高频测试前先确认额度。
 - REST 接口没有鉴权，只适合本机或内网开发调试，不要直接暴露到公网。
 - Windows 控制台中文乱码时，可用 Windows Terminal，或在启动前执行 `chcp 65001`。
@@ -171,6 +177,8 @@ mvn spring-boot:run
 | `rag.retrieve.candidates` / `rag.retrieve.top-k` | `20` / `5` | 每路召回候选数 / 重排后进入 Prompt 的知识块数 |
 | `rag.rerank.model` | `gte-rerank-v2` | 重排模型，调用失败自动降级本地规则重排 |
 | `rag.index.auto-build` | `true` | 启动时自动构建索引 |
+| `monitor.enabled` | `true` | 是否开启行程护航定时巡检 |
+| `monitor.check-interval-minutes` | `30` | 行程护航巡检间隔（分钟） |
 | `wechat.auto-login` | `true` | 启动时自动恢复登录态或打印二维码 |
 | `wechat.resume-file` | `${user.home}/.wechat-demo-resume.json` | 微信登录态保存位置 |
 | `logging.charset.console` | `UTF-8` | 控制台日志编码 |
@@ -350,7 +358,7 @@ public String execute(String userText, SkillContext ctx) throws Exception {
 mvn test
 ```
 
-当前测试覆盖 Spring 上下文加载、工具串行 / 并行执行、实时路况工具、交通出行推荐，以及 RAG 的指南加载、清洗、切分、VSM 关键词检索、RRF 混合融合与本地重排兜底，共 29 个用例，不需要真实 API Key。
+当前测试覆盖 Spring 上下文加载、工具串行 / 并行执行、实时路况工具、交通出行推荐，RAG 的指南加载、清洗、切分、VSM 关键词检索、RRF 混合融合与本地重排兜底，以及行程护航的注册表隔离、触发裁判解析与技能命令路由，共 42 个用例，不需要真实 API Key。
 
 使用 Maven Wrapper 时执行：
 
@@ -382,7 +390,10 @@ src/main/java/com/group/autotrip/
 │   ├── Skill.java               Skill 接口
 │   ├── SkillContext.java        Skill 执行上下文
 │   ├── SkillRegistry.java       Skill 注册表
-│   └── SkillDispatcher.java     Skill 关键词调度器
+│   ├── SkillDispatcher.java     Skill 关键词调度器
+│   └── TripGuardSkill.java      行程护航技能（注册/查看/取消监控）
+├── monitor/
+│   └── MonitorService.java      行程护航：监控注册表、定时巡检、LLM 触发判断、微信告警推送
 ├── tools/
 │   ├── CustomTools.java         工具注册与分发
 │   ├── QueryWeatherTool.java    天气查询工具

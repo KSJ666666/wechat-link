@@ -175,7 +175,7 @@ public class WeChatService implements ApplicationRunner {
     }
 
     private void handleReply(String toUserId, String text) throws Exception {
-        String reply = dashScopeService.chatOrGenerate(text).text();
+        String reply = dashScopeService.chatOrGenerate(toUserId, text).text();
         requireClient();
         client.sendText(toUserId, reply);
         log.info("已向 {} 发送 LLM 文本回复", toUserId);

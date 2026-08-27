@@ -117,10 +117,18 @@ public class DashScopeService {
      * 模型会调用天气等工具获取准确数据，否则返回文本回复。
      */
     public ChatResult chatOrGenerate(String userText) throws IOException {
+        return chatOrGenerate(null, userText);
+    }
+
+    /**
+     * 对话 + 自动判断是否调用工具（函数调用），携带发送者用户 ID。
+     * userId 供 Skill 按用户存储状态（如行程护航监控），直连调用时为 null。
+     */
+    public ChatResult chatOrGenerate(String userId, String userText) throws IOException {
         requireKey();
 
         Optional<String> skillReply = skillDispatcher.tryExecute(
-                new SkillContext(userText, customTools, this));
+                new SkillContext(userId, userText, customTools, this));
         if (skillReply.isPresent()) {
             return new ChatResult(skillReply.get());
         }
