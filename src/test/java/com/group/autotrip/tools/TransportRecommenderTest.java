@@ -42,6 +42,50 @@ class TransportRecommenderTest {
     }
 
     @Test
+    void straightLineDistanceEstimatesKm() {
+        AmapService.PoiInfo hangzhou = poiAt("杭州", "杭州市", "120.15,30.28");
+        AmapService.PoiInfo huangshan = poiAt("黄山", "黄山市", "118.14,29.71");
+        assertTrue(TransportRecommender.straightLineKm(hangzhou, huangshan) > 80,
+                "杭州到黄山直线距离应超过 80 公里");
+        AmapService.PoiInfo near = poiAt("B", "北京", "116.41,39.92");
+        AmapService.PoiInfo a = poiAt("A", "北京", "116.40,39.91");
+        assertTrue(TransportRecommender.straightLineKm(a, near) < 80, "近点距离应远小于 80 公里");
+        AmapService.PoiInfo noLocation = poiAt("X", "北京", "");
+        assertEquals(-1.0, TransportRecommender.straightLineKm(noLocation, near), 0.0001,
+                "坐标缺失应返回 -1");
+    }
+
+    @Test
+    void walkingSkippedForLongDistanceRoutes() throws Exception {
+        amap.poiAt("杭州", "杭州市", "120.15,30.28");
+        amap.poiAt("黄山", "黄山市", "118.14,29.71");
+        amap.driving(250_000, 12_000);
+        amap.transit(List.of(option(TransportMode.RAIL, 200_000, 3_600)));
+
+        TransportRecommender.Recommendation result = recommender(false)
+                .recommend("杭州", "黄山", "杭州", "黄山", null, null);
+
+        assertEquals(0, amap.walkingCalls, "超限远距离不应发起步行规划请求");
+        assertNotEquals(null, result.recommended());
+    }
+
+    @Test
+    void walkingStillCalledForShortRoutes() throws Exception {
+        amap.poiAt("A", "北京", "116.40,39.91");
+        amap.poiAt("B", "北京", "116.41,39.92");
+        amap.walking(1_200, 900);
+        amap.driving(1_500, 300);
+
+        recommender(false).recommend("A", "B", "北京", "北京", null, null);
+
+        assertEquals(1, amap.walkingCalls, "近距离路线应正常调用步行规划");
+    }
+
+    private static AmapService.PoiInfo poiAt(String name, String city, String lngLat) {
+        return new AmapService.PoiInfo("id-" + name, name, "", "", city, "", "", lngLat);
+    }
+
+    @Test
     void rushHourRecommendsMetroInMetroCity() throws Exception {
         amap.poi("国贸", "北京");
         amap.poi("颐和园", "北京");
@@ -148,9 +192,14 @@ class TransportRecommenderTest {
         private RouteOption driving;
         private RouteOption walking;
         private List<RouteOption> transits = List.of();
+        private int walkingCalls;
 
         void poi(String name, String city) {
             pois.put(name, new PoiInfo("id-" + name, name, "", "", city, "", "", "116.0,39.9"));
+        }
+
+        void poiAt(String name, String city, String lngLat) {
+            pois.put(name, new PoiInfo("id-" + name, name, "", "", city, "", "", lngLat));
         }
 
         void driving(long distanceMeters, long durationSeconds) {
@@ -181,6 +230,7 @@ class TransportRecommenderTest {
 
         @Override
         public RouteOption getWalkingRoute(PoiInfo from, PoiInfo to) throws IOException {
+            walkingCalls++;
             return requireOption(walking, "步行");
         }
 

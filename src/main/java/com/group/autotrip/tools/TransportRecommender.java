@@ -31,6 +31,9 @@ public class TransportRecommender {
     private static final long LONG_LIMIT_METERS = 30_000;
     private static final long CROSS_CITY_RAIL_LIMIT_METERS = 100_000;
 
+    /** 步行规划接口的直线距离上限（公里），官方 100 公里，留 20 公里余量避免接口报错 */
+    private static final double WALKING_API_MAX_KM = 80;
+
     private final AmapService amapService;
     private final CityTransportSupport citySupport;
 
@@ -76,10 +79,14 @@ public class TransportRecommender {
         }
 
         List<RouteOption> options = new ArrayList<>();
+        double straightKm = straightLineKm(from, to);
         if (!avoidDriving) {
             addQuietly(options, () -> List.of(amapService.getDrivingRouteOption(from, to)));
         }
-        addQuietly(options, () -> List.of(amapService.getWalkingRoute(from, to)));
+        // 步行规划接口有约 100 公里上限，超限的远距离路线直接跳过，不发起必然失败的请求
+        if (straightKm < 0 || straightKm <= WALKING_API_MAX_KM) {
+            addQuietly(options, () -> List.of(amapService.getWalkingRoute(from, to)));
+        }
         if (!transitCity.isBlank() && !transitCityd.isBlank()) {
             addQuietly(options, () -> amapService.getTransitRoutes(from, to, transitCity, transitCityd));
         }
@@ -251,7 +258,41 @@ public class TransportRecommender {
                 options.addAll(result);
             }
         } catch (IOException e) {
-            log.warn("获取某类交通路线失败：{}", e.getMessage());
+            String message = e.getMessage();
+            if (message != null && message.contains("OVER_DIRECTION_RANGE")) {
+                // 起终点距离超出该方式规划上限，属预期情况，静默跳过即可
+                log.debug("跳过超距离交通方式：{}", message);
+            } else {
+                log.warn("获取某类交通路线失败：{}", message);
+            }
+        }
+    }
+
+    /** 两点间直线距离（公里）；坐标缺失时返回 -1（表示未知，调用方按不限制处理） */
+    static double straightLineKm(AmapService.PoiInfo from, AmapService.PoiInfo to) {
+        double[] a = parseLngLat(from.location());
+        double[] b = parseLngLat(to.location());
+        if (a == null || b == null) {
+            return -1;
+        }
+        double lat1 = Math.toRadians(a[1]);
+        double lat2 = Math.toRadians(b[1]);
+        double dLat = Math.toRadians(b[1] - a[1]);
+        double dLng = Math.toRadians(b[0] - a[0]);
+        double h = Math.sin(dLat / 2) * Math.sin(dLat / 2)
+                + Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLng / 2) * Math.sin(dLng / 2);
+        return 6371.0 * 2 * Math.asin(Math.sqrt(h));
+    }
+
+    private static double[] parseLngLat(String location) {
+        if (location == null || !location.contains(",")) {
+            return null;
+        }
+        try {
+            String[] parts = location.split(",");
+            return new double[]{Double.parseDouble(parts[0].trim()), Double.parseDouble(parts[1].trim())};
+        } catch (NumberFormatException e) {
+            return null;
         }
     }
 
