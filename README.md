@@ -115,6 +115,7 @@ mvn spring-boot:run
 | 景点指南检索 | `query_guide_rag`：基于本地知识库（大理/杭州/上海/长沙景点指南）的 RAG 问答，向量 + 关键词混合检索、重排后由大模型生成带来源的答案 |
 | Function Calling | 模型可自动调用已注册工具，支持一轮多工具并行或串行执行 |
 | Skill 技能 | 关键词命中的技能直接执行，不依赖模型自行判断；当前已具备框架，可继续添加技能 |
+| 旅行规划 Skill | 命中明确的自驾旅行需求时，会串联路线、景点、距离和天气工具，生成适合直接发送的路书 |
 | 开发自测接口 | `/wechat/llm/chat` 等接口可在不登录微信时验证 LLM 和工具链路 |
 
 ## 消息处理流程
@@ -278,6 +279,8 @@ public class ExampleTool implements FunctionTool {
 4. `name()` 在所有 Skill 中全局唯一。
 5. `supports()` 用关键词判断是否由本 Skill 处理；`SkillDispatcher` 按注册顺序匹配，命中第一个就执行，因此关键词不要写得过于宽泛。
 6. 在 `execute()` 中可以通过 `ctx.userText()` 取用户消息，通过 `ctx.tools()` 调用工具，通过 `ctx.llm()` 调用 LLM。
+
+当前仓库中的旅行规划 Skill 会先解析出发地、目的地、天数和偏好，再串联 `query_weather`、`query_weather_forecast`、`query_route`、`query_attractions`、`query_attraction_detail`、`query_distance_matrix`、`search_poi` 和 `query_traffic`，最后交给 `ctx.llm()` 组织成适合直接发送的路书。
 
 示例：
 
