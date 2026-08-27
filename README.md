@@ -31,8 +31,9 @@
 | 天气工具 | 已完成 | 实时天气 `query_weather` + 未来天气预报 `query_weather_forecast` |
 | 高德地图工具 | 已完成 | POI 搜索、景点、路况、路线、距离矩阵 |
 | 出行推荐 | 已完成 | 综合距离、城市地铁、高峰时段和用户偏好推荐交通方式 |
+| 景点指南 RAG 检索 | 已完成 | 指南 JSON 清洗 → 切分 → 阿里云嵌入向量化 → Milvus + VSM 混合检索 → 重排 → LLM 生成 |
 | 行程数据模型 | 进行中 | `Route` / `Itinerary` / `DayPlan` / `Spot` 已定义，完整行程生成流程尚未接入 |
-| 测试 | 已完成 | 当前 11 个测试用例全部通过，覆盖工具执行、路况和交通推荐 |
+| 测试 | 已完成 | 当前 29 个测试用例全部通过，覆盖工具执行、路况、交通推荐与 RAG 清洗/切分/检索/重排 |
 
 ## 快速开始
 
@@ -111,6 +112,7 @@ mvn spring-boot:run
 | 实时路况 | `query_traffic`：查询某城市某条道路的拥堵情况 |
 | 出行路线 | `query_route`：查询两地点间的步行、公交、地铁、驾车、高铁方案并给出推荐 |
 | 距离比较 | `query_distance_matrix`：一次计算一个起点到多个目的地的距离和耗时 |
+| 景点指南检索 | `query_guide_rag`：基于本地知识库（大理/杭州/上海/长沙景点指南）的 RAG 问答，向量 + 关键词混合检索、重排后由大模型生成带来源的答案 |
 | Function Calling | 模型可自动调用已注册工具，支持一轮多工具并行或串行执行 |
 | Skill 技能 | 关键词命中的技能直接执行，不依赖模型自行判断；当前已具备框架，可继续添加技能 |
 | 开发自测接口 | `/wechat/llm/chat` 等接口可在不登录微信时验证 LLM 和工具链路 |
@@ -138,6 +140,9 @@ mvn spring-boot:run
 - 一次消息最多执行 12 轮工具调用（`dashscope.tool-execution-max-rounds` 可调），达到上限后会自动让模型基于已有结果收尾。
 - 高德 Web 服务有并发和每日配额限制，代码内已限制最多 2 个并发请求并在限流时重试一次，但高频使用仍可能触发配额耗尽。
 - 交通推荐依赖 `cities-transport.json` 中的城市地铁 / 铁路档案；未收录的城市仍可查询，但无法判断是否通地铁。
+- 景点指南 RAG 检索依赖本机 Milvus 容器（`localhost:19530`）和 `DASHSCOPE_API_KEY`；Milvus 不可用或嵌入失败时自动降级为纯关键词检索，不影响其他功能。
+- 启动时会自动重建 RAG 索引（清洗 → 切分 → 向量化 → 写入 Milvus，40 个景点一般十几秒完成）；知识块持久化在 Milvus，内存 VSM 关键词索引重启后重建。
+- 微信端询问大理 / 杭州 / 上海 / 长沙景点时模型会调用 `query_guide_rag`，链路含嵌入、检索、重排和 LLM 生成，回复会比普通消息慢几秒。
 - 联网搜索和模型调用会产生 API 费用，长时间运行或高频测试前先确认额度。
 - REST 接口没有鉴权，只适合本机或内网开发调试，不要直接暴露到公网。
 - Windows 控制台中文乱码时，可用 Windows Terminal，或在启动前执行 `chcp 65001`。
@@ -158,6 +163,13 @@ mvn spring-boot:run
 | `dashscope.enable-search` | `true` | 是否开启联网搜索兜底 |
 | `dashscope.forced-search` | `true` | 命中实时类关键词后是否强制搜索 |
 | `dashscope.search-extension` | `true` | 是否启用垂域搜索 |
+| `rag.embedding.model` | `text-embedding-v3` | RAG 嵌入模型（阿里云百炼，API Key 复用 `DASHSCOPE_API_KEY`） |
+| `rag.embedding.dimensions` | `1024` | 嵌入向量维度（需与 Milvus 集合一致） |
+| `rag.milvus.host` / `rag.milvus.port` | `localhost` / `19530` | Milvus 向量库连接地址 |
+| `rag.milvus.collection` | `trip_guide_chunks` | Milvus 集合名 |
+| `rag.retrieve.candidates` / `rag.retrieve.top-k` | `20` / `5` | 每路召回候选数 / 重排后进入 Prompt 的知识块数 |
+| `rag.rerank.model` | `gte-rerank-v2` | 重排模型，调用失败自动降级本地规则重排 |
+| `rag.index.auto-build` | `true` | 启动时自动构建索引 |
 | `wechat.auto-login` | `true` | 启动时自动恢复登录态或打印二维码 |
 | `wechat.resume-file` | `${user.home}/.wechat-demo-resume.json` | 微信登录态保存位置 |
 | `logging.charset.console` | `UTF-8` | 控制台日志编码 |
@@ -187,6 +199,7 @@ mvn spring-boot:run
 | `query_traffic` | `QueryTrafficTool` | 查询某条道路的实时拥堵情况 | `city`、`road` |
 | `query_route` | `QueryRouteTool` | 查询两地间多种交通方式并给出推荐 | `origin`、`destination`；可选 `city`、`originCity`、`destinationCity`、`mode`、`prefer` |
 | `query_distance_matrix` | `QueryDistanceMatrixTool` | 一次计算起点到多个目的地的距离和耗时并排序 | `origin`、`destinations`；可选 `city`、`mode` |
+| `query_guide_rag` | `RagKnowledgeTool` | 大理/杭州/上海/长沙景点指南 RAG 问答 | `query`；可选 `city` |
 
 `CustomTools.execute("工具名", JsonNode 参数)` 会按名称找到工具并执行，返回给模型的必须是字符串。工具名重复时 Spring 启动会直接报“工具名冲突”。
 
@@ -334,7 +347,7 @@ public String execute(String userText, SkillContext ctx) throws Exception {
 mvn test
 ```
 
-当前测试覆盖 Spring 上下文加载、工具串行 / 并行执行、实时路况工具和交通出行推荐，共 11 个用例，不需要真实 API Key。
+当前测试覆盖 Spring 上下文加载、工具串行 / 并行执行、实时路况工具、交通出行推荐，以及 RAG 的指南加载、清洗、切分、VSM 关键词检索、RRF 混合融合与本地重排兜底，共 29 个用例，不需要真实 API Key。
 
 使用 Maven Wrapper 时执行：
 
@@ -352,6 +365,16 @@ src/main/java/com/group/autotrip/
 ├── common/
 │   ├── FunctionTool.java        工具接口
 │   └── model/                   Route / Itinerary / DayPlan / Spot / RouteOption / TransportMode
+├── rag/
+│   ├── RagService.java          RAG 问答编排（query 向量化 → 混合检索 → 重排 → Prompt → LLM）
+│   ├── RagIndexer.java          建库编排（清洗 → 切分 → 向量化 → Milvus / VSM 索引）
+│   ├── RagKnowledgeTool.java    景点指南 RAG 工具（query_guide_rag）
+│   ├── RagController.java       调试接口 /rag/status、/rag/reindex、/rag/ask
+│   ├── ingest/                  GuideDataLoader / GuideCleaner / GuideChunker（知识源加载、清洗、切分）
+│   ├── embed/                   DashScopeEmbeddingClient（阿里云嵌入客户端）
+│   ├── store/                   MilvusVectorStore / VsmKeywordIndex（向量库 + 内存 VSM 关键词索引）
+│   ├── retrieve/                HybridRetriever / Reranker / RagPromptBuilder（混合检索、重排、Prompt）
+│   └── model/                   知识块等数据结构
 ├── skill/
 │   ├── Skill.java               Skill 接口
 │   ├── SkillContext.java        Skill 执行上下文

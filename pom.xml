@@ -60,6 +60,12 @@
 			<groupId>com.fasterxml.jackson.core</groupId>
 			<artifactId>jackson-databind</artifactId>
 		</dependency>
+		<!-- Milvus 向量数据库 Java SDK（对应 Milvus server 2.4.x） -->
+		<dependency>
+			<groupId>io.milvus</groupId>
+			<artifactId>milvus-sdk-java</artifactId>
+			<version>2.4.11</version>
+		</dependency>
 	</dependencies>
 
 	<build>
