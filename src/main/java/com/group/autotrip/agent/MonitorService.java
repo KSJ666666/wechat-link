@@ -182,7 +182,8 @@ public class MonitorService {
             return; // 取不到数据（如 BUDGET 且无行程单）静默跳过
         }
         if (!judge(target.rule(), data)) {
-            log.debug("监控未触发：{}，数据：{}", target.name(), data);
+            log.info("监控未触发：{}（{}），规则：{}，数据：{}",
+                    target.name(), target.type().label(), target.rule(), data);
             return;
         }
         log.info("监控触发：{}（{}），规则：{}，数据：{}",

@@ -31,3 +31,16 @@ build/
 
 ### VS Code ###
 .vscode/
+
+### 会话与工具目录 ###
+.zcode/
+.codegraph/
+
+### 本地运行产物与状态 ###
+*.log
+.wechat-demo-resume.json
+.autotrip-state.json
+
+### 系统文件 ###
+.DS_Store
+Thumbs.db

@@ -4,7 +4,7 @@ import com.fasterxml.jackson.annotation.JsonCreator;
 import com.fasterxml.jackson.annotation.JsonValue;
 
 /**
- * 路线类型。对应 {@link Route#routeType} 的规范化枚举。
+ * 路线类型。
  */
 public enum RouteKind {
     EXPRESSWAY("高速"),
