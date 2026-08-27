@@ -1,21 +1,57 @@
 package com.group.autotrip.skill;
 
+import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.group.autotrip.output.TripPlanOutput;
+import com.fasterxml.jackson.databind.SerializationFeature;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
+import com.group.autotrip.agent.TripPlanStore;
+import com.group.autotrip.common.model.DayPlan;
+import com.group.autotrip.common.model.Itinerary;
+import com.group.autotrip.common.model.PlanStatus;
+import com.group.autotrip.common.model.Route;
+import com.group.autotrip.common.model.RouteKind;
+import com.group.autotrip.output.ItineraryOutput;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
+import java.time.LocalDate;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
-/** 自驾/旅行规划 Skill：按“解析 -> 工具 -> LLM -> 成品输出”串起来。 */
+/**
+ * 自驾/旅行规划 Skill：解析需求（LLM 优先、正则兜底）→ 工具取数 →
+ * LLM 生成结构化行程单（{@link Itinerary}）→ 存储 → 排版回复；
+ * 支持基于已存行程单的重规划（"第二天太赶了，重新排"）。
+ */
 @Component
 public class TripPlanSkill implements Skill {
 
-    private static final ObjectMapper MAPPER = new ObjectMapper();
+    private static final Logger log = LoggerFactory.getLogger(TripPlanSkill.class);
+
+    private static final ObjectMapper MAPPER = new ObjectMapper()
+            .registerModule(new JavaTimeModule())
+            .disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS)
+            .configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
+
     private static final Pattern NUMBERED_ITEM = Pattern.compile("^\\s*\\d+[.、]\\s*(.+)$");
+    private static final Pattern DAYS_PATTERN = Pattern.compile("(\\d+|[一二两三四五六七八九十])\\s*[天晚]");
+
+    private static final List<String> PLAN_WORDS = List.of(
+            "自驾", "行程", "规划", "路书", "行程单", "怎么玩", "怎么去",
+            "出发地", "目的地", "顺路", "沿途", "出游", "几天", "几晚");
+    private static final List<String> REPLAN_WORDS = List.of(
+            "重排", "重新规划", "重新排", "调整", "太赶", "太满", "太累", "改一下");
+
+    private final TripPlanStore store;
+
+    public TripPlanSkill(TripPlanStore store) {
+        this.store = store;
+    }
 
     @Override
     public String name() {
@@ -24,7 +60,8 @@ public class TripPlanSkill implements Skill {
 
     @Override
     public String description() {
-        return "处理明确的自驾旅行规划需求，例如“从杭州到黄山三天自驾，偏景点和轻松节奏”，会串联路线、景点、距离和天气工具。";
+        return "处理明确的自驾旅行规划需求（如“从杭州到黄山三天自驾”），串联路线、景点、距离和天气工具，"
+                + "生成结构化行程单；也处理对已有行程单的重规划（如“第二天太赶了，重新排”）。";
     }
 
     @Override
@@ -32,35 +69,174 @@ public class TripPlanSkill implements Skill {
         if (userText == null) {
             return false;
         }
-        return containsAny(userText,
-                "自驾", "旅行", "旅游", "行程", "路线", "路书", "规划", "出游", "怎么玩", "怎么去",
-                "几天", "几晚", "出发地", "目的地", "行程单", "顺路", "沿途", "攻略");
+        return containsAny(userText, PLAN_WORDS)
+                || DAYS_PATTERN.matcher(userText).find()
+                || containsAny(userText, REPLAN_WORDS);
     }
 
     @Override
     public String execute(String userText, SkillContext ctx) throws Exception {
-        ParsedTripRequest request = ParsedTripRequest.from(userText);
-        if (request.destination().isBlank()) {
+        // 重规划优先：已有行程单时按反馈重新生成
+        if (containsAny(userText, REPLAN_WORDS)) {
+            if (!store.has(ctx.userId())) {
+                return "还没有已保存的行程单，先规划一个再调整吧。例如：从杭州到黄山三天自驾。";
+            }
+            return replan(userText, ctx);
+        }
+
+        ParsedTripRequest request = parseRequest(userText, ctx);
+        if (request.destination().isBlank() && request.origin().isBlank()) {
             return "我已经命中旅行规划技能，但还缺目的地。你可以直接告诉我“从哪到哪、几天、偏景点还是偏休闲”。";
         }
 
-        List<String> sections = new ArrayList<>();
-        String weatherNow = execTool(ctx, "query_weather", MAPPER.createObjectNode().put("location", request.destination()));
-        if (!weatherNow.isBlank()) {
-            sections.add("实时天气：\n" + weatherNow);
-        }
+        ToolData data = collectToolData(userText, request, ctx);
+        Itinerary itinerary = buildItinerary(userText, request, data, ctx);
+        store.save(ctx.userId(), itinerary);
 
+        StringBuilder reply = new StringBuilder(ItineraryOutput.render(itinerary));
+        appendWeatherSections(reply, data);
+        reply.append("\n\n如需调整，可以说“重新排”或“第二天太赶了，改一下”。");
+        return reply.toString();
+    }
+
+    // ===== 重规划 =====
+
+    private String replan(String userText, SkillContext ctx) throws Exception {
+        Itinerary previous = store.get(ctx.userId());
+        String prompt = """
+                你是一个自驾旅行规划助手。用户对上一版行程单提出了调整意见，请生成新版行程单 JSON。
+                要求：
+                1. 只输出 JSON，字段结构与上一版相同：{title, route{start,end,waypoints,distanceKm,durationMin,routeType}, days[{day,date,spots[{name,address,openTime,ticketPrice,brief,tip}],stayCity,drivingKm,note}], budget, budgetItems[{category,amount,note}], notes, status:"草拟"}。
+                2. 针对用户意见修改对应部分，其余内容尽量保留；日期沿用上一版或从今天起连续排。
+                3. 不要编造新的景点名。
+
+                用户意见：%s
+
+                上一版行程单 JSON：
+                %s
+                """.formatted(userText, MAPPER.writeValueAsString(previous));
+        try {
+            String json = firstJsonObject(ctx.llm().chat(prompt));
+            if (json != null) {
+                Itinerary updated = MAPPER.readValue(json, Itinerary.class);
+                store.save(ctx.userId(), updated);
+                return ItineraryOutput.render(updated) + "\n\n已按你的反馈重新排好，还有不满意的地方继续说。";
+            }
+        } catch (Exception e) {
+            log.warn("重规划失败：{}", e.getMessage());
+        }
+        return "重排失败了，可以再试一次，或重新描述你的需求（例如“帮我规划三天杭州行程”）。";
+    }
+
+    // ===== 结构化行程单 =====
+
+    private Itinerary buildItinerary(String userText, ParsedTripRequest request, ToolData data, SkillContext ctx) {
+        String schemaHint = """
+                {
+                  "title": "行程标题",
+                  "route": {"start": "出发地", "end": "目的地", "waypoints": [], "distanceKm": 0, "durationMin": 0, "routeType": "高速"},
+                  "days": [{"day": 1, "date": "2026-08-28", "spots": [{"name": "景点", "address": "地址", "openTime": "开放时间", "ticketPrice": 0, "brief": "简介", "tip": "提示"}], "stayCity": "住宿城市", "drivingKm": 0, "note": "当日说明"}],
+                  "budget": 0,
+                  "budgetItems": [{"category": "住宿", "amount": 0, "note": "说明"}],
+                  "notes": ["注意事项"],
+                  "status": "草拟"
+                }
+                """;
+        String prompt = """
+                你是一个自驾旅行规划助手。请根据下面的结构化需求与工具结果，生成一版旅行行程单 JSON。
+                要求：
+                1. 只输出 JSON，不要输出任何其他内容。
+                2. 字段结构严格按示例：%s
+                3. days 的天数等于需求天数，date 从 %s 起连续排；每天 2-3 个景点，只使用工具结果中出现的景点名，不要编造。
+                4. budget 为总预算（元），budgetItems 按住宿/门票/餐饮/油费/过路费等分类估算。
+                5. route.routeType 只取：高速、国道、省道、其他。
+                6. 没有数据支撑的字段填空或 0。
+
+                用户需求与工具结果：
+                %s
+                """.formatted(schemaHint, LocalDate.now(), buildContext(userText, request, data));
+        try {
+            String json = firstJsonObject(ctx.llm().chat(prompt));
+            if (json != null) {
+                return MAPPER.readValue(json, Itinerary.class);
+            }
+        } catch (Exception e) {
+            log.warn("LLM 行程单解析失败，使用兜底行程单：{}", e.getMessage());
+        }
+        return fallbackItinerary(request, data);
+    }
+
+    /** LLM 不可用或 JSON 解析失败时的兜底行程单 */
+    static Itinerary fallbackItinerary(ParsedTripRequest request, ToolData data) {
+        List<DayPlan> days = new ArrayList<>();
+        LocalDate start = LocalDate.now();
+        for (int i = 0; i < Math.max(1, request.days()); i++) {
+            days.add(new DayPlan(i + 1, start.plusDays(i), List.of(), request.destination(), 0, ""));
+        }
+        Route route = new Route(request.origin(), request.destination(), List.of(), 0, 0, RouteKind.OTHER);
+        String title = (request.origin().isBlank() ? "" : request.origin() + "→")
+                + request.destination() + " " + Math.max(1, request.days()) + "天行程";
+        List<String> notes = new ArrayList<>();
+        notes.add("本行程单为兜底版本，可回复“重新排”或补充更多信息后再次生成。");
+        if (!data.attractions().isBlank()) {
+            notes.add("参考景点见下方检索结果，可据此自行安排。");
+        }
+        return new Itinerary(title, route, days, 0, notes, PlanStatus.DRAFT, List.of());
+    }
+
+    private static String buildContext(String userText, ParsedTripRequest request, ToolData data) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("用户原话：").append(userText).append("\n");
+        sb.append("出发地：").append(nonBlank(request.origin(), "未提供")).append("\n");
+        sb.append("目的地：").append(nonBlank(request.destination(), "未提供")).append("\n");
+        sb.append("天数：").append(Math.max(1, request.days())).append("\n");
+        sb.append("偏好：").append(nonBlank(request.style(), "未提供")).append("\n");
+        appendSection(sb, "实时天气", data.weatherNow());
+        appendSection(sb, "天气预报", data.forecast());
+        appendSection(sb, "路线推荐", data.route());
+        appendSection(sb, "路况参考", data.traffic());
+        appendSection(sb, "景点列表", data.attractions());
+        appendSection(sb, "重点景点详情", String.join("\n", data.attractionDetails()));
+        appendSection(sb, "景点顺路排序", data.matrix());
+        return sb.toString();
+    }
+
+    private static void appendSection(StringBuilder sb, String title, String content) {
+        if (content != null && !content.isBlank()) {
+            sb.append(title).append("：\n").append(content.trim()).append("\n");
+        }
+    }
+
+    private static void appendWeatherSections(StringBuilder reply, ToolData data) {
+        if (!data.weatherNow().isBlank() || !data.forecast().isBlank()) {
+            reply.append("\n沿途天气参考：\n");
+            if (!data.weatherNow().isBlank()) {
+                reply.append(data.weatherNow().trim()).append("\n");
+            }
+            if (!data.forecast().isBlank()) {
+                reply.append(data.forecast().trim()).append("\n");
+            }
+        }
+    }
+
+    // ===== 工具取数 =====
+
+    /** 工具取数结果（包内可见，便于测试兜底行程单） */
+    record ToolData(String weatherNow, String forecast, String route, String traffic,
+                    String attractions, List<String> attractionDetails, String matrix) {
+    }
+
+    private ToolData collectToolData(String userText, ParsedTripRequest request, SkillContext ctx) {
+        String weatherNow = execTool(ctx, "query_weather",
+                MAPPER.createObjectNode().put("location", request.destination()));
         String forecast = execTool(ctx, "query_weather_forecast",
                 MAPPER.createObjectNode()
                         .put("location", request.destination())
                         .put("days", Math.min(Math.max(request.days(), 1), 5)));
-        if (!forecast.isBlank()) {
-            sections.add("天气预报：\n" + forecast);
-        }
 
         String route = "";
         if (!request.origin().isBlank()) {
-            com.fasterxml.jackson.databind.node.ObjectNode routeArgs = MAPPER.createObjectNode()
+            ObjectNode routeArgs = MAPPER.createObjectNode()
                     .put("origin", request.origin())
                     .put("destination", request.destination())
                     .put("mode", "all")
@@ -70,20 +246,15 @@ public class TripPlanSkill implements Skill {
             }
             route = execTool(ctx, "query_route", routeArgs);
         }
-        if (!route.isBlank()) {
-            sections.add("路线推荐：\n" + route);
-        }
 
+        String traffic = "";
         if (shouldUseTraffic(userText)) {
             String road = guessRoad(userText);
             if (!road.isBlank()) {
-                String traffic = execTool(ctx, "query_traffic",
+                traffic = execTool(ctx, "query_traffic",
                         MAPPER.createObjectNode()
                                 .put("city", nonBlank(request.destination(), request.origin()))
                                 .put("road", road));
-                if (!traffic.isBlank()) {
-                    sections.add("路况参考：\n" + traffic);
-                }
             }
         }
 
@@ -91,10 +262,6 @@ public class TripPlanSkill implements Skill {
                 MAPPER.createObjectNode()
                         .put("city", request.destination())
                         .put("limit", 5));
-        if (!attractions.isBlank()) {
-            sections.add("景点列表：\n" + attractions);
-        }
-
         List<String> attractionNames = extractItemNames(attractions, 3);
         List<String> attractionDetails = new ArrayList<>();
         for (String name : attractionNames) {
@@ -106,12 +273,10 @@ public class TripPlanSkill implements Skill {
                 attractionDetails.add(detail);
             }
         }
-        if (!attractionDetails.isEmpty()) {
-            sections.add("重点景点详情：\n" + String.join("\n", attractionDetails));
-        }
 
+        String matrix = "";
         if (!request.origin().isBlank() && !attractionNames.isEmpty()) {
-            com.fasterxml.jackson.databind.node.ObjectNode matrixArgs = MAPPER.createObjectNode()
+            ObjectNode matrixArgs = MAPPER.createObjectNode()
                     .put("origin", request.origin())
                     .put("city", request.destination())
                     .put("mode", "driving");
@@ -119,96 +284,107 @@ public class TripPlanSkill implements Skill {
             for (String name : attractionNames) {
                 arr.add(name);
             }
-            String matrix = execTool(ctx, "query_distance_matrix", matrixArgs);
-            if (!matrix.isBlank()) {
-                sections.add("景点顺路排序：\n" + matrix);
-            }
+            matrix = execTool(ctx, "query_distance_matrix", matrixArgs);
         }
-
-        if (shouldUsePoiSearch(userText)) {
-            String poi = execTool(ctx, "search_poi",
-                    MAPPER.createObjectNode()
-                            .put("keywords", request.style().isBlank() ? "酒店" : request.style())
-                            .put("city", request.destination())
-                            .put("limit", 5));
-            if (!poi.isBlank()) {
-                sections.add("周边地点：\n" + poi);
-            }
-        }
-
-        String llmPlan = ctx.llm().chat(buildPlannerPrompt(userText, request, sections));
-
-        return TripPlanOutput.render(
-                request.origin(),
-                request.destination(),
-                request.days(),
-                request.style(),
-                weatherNow,
-                forecast,
-                route,
-                attractions,
-                attractionDetails,
-                llmPlan,
-                buildTips(request, sections));
+        return new ToolData(weatherNow, forecast, route, traffic, attractions, attractionDetails, matrix);
     }
 
-    private String buildPlannerPrompt(String userText, ParsedTripRequest request, List<String> sections) {
-        StringBuilder context = new StringBuilder();
-        for (String section : sections) {
-            context.append(section).append("\n\n");
+    private String execTool(SkillContext ctx, String name, JsonNode args) {
+        try {
+            return ctx.tools().execute(name, args);
+        } catch (Exception e) {
+            return "";
         }
-        return """
-                你是一个旅行规划助手。请根据下面的工具结果，生成一版适合直接发给用户的中文旅行路书。
-                要求：
-                1. 只输出成品内容，不要分析过程。
-                2. 结构尽量清晰：先总览，再分天，再给执行建议。
-                3. 不要编造工具里没有出现的具体景点名。
-                4. 如果路线、天气、景点信息冲突，优先采用工具结果。
-                5. 语言简洁自然，适合微信直接发送。
-
-                用户原话：
-                %s
-
-                结构化信息：
-                出发地：%s
-                目的地：%s
-                天数：%d
-                偏好：%s
-
-                工具结果：
-                %s
-                """.formatted(
-                userText,
-                nonBlank(request.origin(), "未提供"),
-                nonBlank(request.destination(), "未提供"),
-                request.days(),
-                nonBlank(request.style(), "未提供"),
-                context);
     }
 
-    private static boolean shouldUsePoiSearch(String userText) {
-        if (userText == null) {
-            return false;
+    // ===== 解析 =====
+
+    /** LLM 优先解析需求，失败时正则兜底 */
+    private ParsedTripRequest parseRequest(String userText, SkillContext ctx) {
+        try {
+            String prompt = "从用户消息中提取自驾行程需求，只输出 JSON："
+                    + "{\"origin\":\"出发地\",\"destination\":\"目的地\",\"days\":3,\"style\":\"偏好\"}，"
+                    + "无法确定的字段填空字符串。\n用户消息：" + userText;
+            String json = firstJsonObject(ctx.llm().chat(prompt));
+            if (json != null) {
+                JsonNode node = MAPPER.readTree(json);
+                ParsedTripRequest parsed = new ParsedTripRequest(
+                        node.path("origin").asText(""),
+                        node.path("destination").asText(""),
+                        Math.max(1, node.path("days").asInt(3)),
+                        node.path("style").asText(""),
+                        "");
+                if (!parsed.destination().isBlank() || !parsed.origin().isBlank()) {
+                    return parsed;
+                }
+            }
+        } catch (Exception e) {
+            log.debug("LLM 解析行程需求失败，使用正则兜底：{}", e.getMessage());
         }
-        return userText.contains("酒店") || userText.contains("餐厅") || userText.contains("吃") || userText.contains("住");
+        return ParsedTripRequest.from(userText);
+    }
+
+    /** 从 LLM 回复中提取首个 JSON 对象（容忍前后多余文字或代码块标记） */
+    static String firstJsonObject(String text) {
+        if (text == null) {
+            return null;
+        }
+        int start = text.indexOf('{');
+        int end = text.lastIndexOf('}');
+        if (start < 0 || end <= start) {
+            return null;
+        }
+        return text.substring(start, end + 1);
     }
 
     private static boolean shouldUseTraffic(String userText) {
         if (userText == null) {
             return false;
         }
-        return userText.contains("路况") || userText.contains("堵车") || userText.contains("拥堵") || userText.contains("高速");
+        return userText.contains("路况") || userText.contains("堵车")
+                || userText.contains("拥堵") || userText.contains("高速");
     }
 
-    private static String guessRoad(String userText) {
-        Matcher matcher = Pattern.compile("([\\u4e00-\\u9fa5A-Za-z0-9]+(?:路|大道|快速路|环路|高速|高速路|高架|隧道))").matcher(userText);
-        if (matcher.find()) {
-            return matcher.group(1).trim();
+    /** 兜底猜测消息中的道路名：找到最早出现的路名后缀后向前扫描，遇到标点或动词截断 */
+    static String guessRoad(String userText) {
+        if (userText == null) {
+            return "";
         }
-        return "";
+        String[] suffixes = {"快速路", "高速路", "大道", "大街", "环路", "高架", "隧道", "高速", "路"};
+        int end = -1;
+        int suffixLength = 0;
+        for (String suffix : suffixes) {
+            int idx = userText.indexOf(suffix);
+            if (idx >= 0 && (end < 0 || idx < end)) {
+                end = idx;
+                suffixLength = suffix.length();
+            }
+        }
+        if (end < 0) {
+            return "";
+        }
+        String stopChars = "，。！？、 看问查说去走顺陪了没有";
+        int start = Math.max(0, end - 10);
+        for (int i = end - 1; i >= start; i--) {
+            if (stopChars.indexOf(userText.charAt(i)) >= 0) {
+                start = i + 1;
+                break;
+            }
+        }
+        String candidate = userText.substring(start, end + suffixLength).trim();
+        // 至少 2 个字才算路名；候选里还混着动词/否定词，说明不是真实路名
+        if (candidate.length() < 2) {
+            return "";
+        }
+        for (char c : candidate.toCharArray()) {
+            if (stopChars.indexOf(c) >= 0) {
+                return "";
+            }
+        }
+        return candidate;
     }
 
-    private static List<String> extractItemNames(String text, int limit) {
+    static List<String> extractItemNames(String text, int limit) {
         List<String> names = new ArrayList<>();
         if (text == null || text.isBlank()) {
             return names;
@@ -237,28 +413,10 @@ public class TripPlanSkill implements Skill {
         return names;
     }
 
-    private String execTool(SkillContext ctx, String name, JsonNode args) {
-        try {
-            return ctx.tools().execute(name, args);
-        } catch (Exception e) {
-            return "";
+    private static boolean containsAny(String text, List<String> keywords) {
+        if (text == null) {
+            return false;
         }
-    }
-
-    private static List<String> buildTips(ParsedTripRequest request, List<String> sections) {
-        List<String> tips = new ArrayList<>();
-        tips.add("每天尽量只安排 2 到 3 个重点，给堵车、停车和临时改线留余量。");
-        tips.add("先确认住宿和停车，再排景点顺序，整体会更顺。");
-        if (request.origin().isBlank()) {
-            tips.add("补一个出发地后，路线顺序还能再优化一次。");
-        }
-        if (sections.isEmpty()) {
-            tips.add("工具结果不够完整时，建议补充城市、起点和偏好，我可以再重排。");
-        }
-        return tips;
-    }
-
-    private static boolean containsAny(String text, String... keywords) {
         for (String keyword : keywords) {
             if (text.contains(keyword)) {
                 return true;
@@ -271,8 +429,9 @@ public class TripPlanSkill implements Skill {
         return value != null && !value.isBlank() ? value : fallback;
     }
 
-    private record ParsedTripRequest(String origin, String destination, int days, String style, String city) {
-        private static ParsedTripRequest from(String userText) {
+    /** 正则兜底解析出的行程需求 */
+    static record ParsedTripRequest(String origin, String destination, int days, String style, String city) {
+        static ParsedTripRequest from(String userText) {
             String origin = guessOrigin(userText);
             String destination = guessDestination(userText);
             int days = guessDays(userText);
@@ -322,15 +481,36 @@ public class TripPlanSkill implements Skill {
         }
 
         private static int guessDays(String userText) {
-            Matcher matcher = Pattern.compile("(\\d+)\\s*天").matcher(userText);
+            Matcher matcher = Pattern.compile("([\\d一二两三四五六七八九十]+)\\s*[天晚]").matcher(userText);
             if (matcher.find()) {
                 try {
                     return Math.max(1, Integer.parseInt(matcher.group(1)));
                 } catch (NumberFormatException ignored) {
-                    return 3;
+                    return Math.max(1, chineseDays(matcher.group(1)));
                 }
             }
             return 3;
+        }
+
+        private static int chineseDays(String text) {
+            int total = 0;
+            for (char c : text.toCharArray()) {
+                switch (c) {
+                    case '十' -> total = total == 0 ? 10 : total + 10;
+                    case '一' -> total += 1;
+                    case '二', '两' -> total += 2;
+                    case '三' -> total += 3;
+                    case '四' -> total += 4;
+                    case '五' -> total += 5;
+                    case '六' -> total += 6;
+                    case '七' -> total += 7;
+                    case '八' -> total += 8;
+                    case '九' -> total += 9;
+                    default -> {
+                    }
+                }
+            }
+            return total;
         }
 
         private static String guessStyle(String userText) {
@@ -346,6 +526,8 @@ public class TripPlanSkill implements Skill {
         private static String cleanPlace(String text) {
             String cleaned = text.replaceAll("[，。！？!?；;、\\s].*$", "").trim();
             cleaned = cleaned.replaceAll("^(帮我|给我|想|需要|安排|规划)+", "");
+            // 去掉尾部“玩三天”“自驾五天”这类天数尾巴
+            cleaned = cleaned.replaceAll("(玩|自驾|行程|旅行|游玩)?([\\d一二两三四五六七八九十]+)\\s*[天晚].*$", "");
             return cleaned.isBlank() ? "" : cleaned;
         }
     }

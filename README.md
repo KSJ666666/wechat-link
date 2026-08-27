@@ -27,14 +27,14 @@
 | --- | --- | --- |
 | 微信接入 | 已完成 | 二维码登录、登录态持久化、文本 / 已转写语音自动回复 |
 | LLM 对话与联网搜索 | 已完成 | 阿里云百炼 `qwen-plus`，工具未命中时联网搜索兜底 |
-| Skill 技能框架 | 已完成 | 关键词调度框架可运行，已内置“行程护航”技能 |
+| Skill 技能框架 | 已完成 | 关键词调度框架可运行，已内置“旅行规划”“行程护航”技能 |
 | 天气工具 | 已完成 | 实时天气 `query_weather` + 未来天气预报 `query_weather_forecast` |
 | 高德地图工具 | 已完成 | POI 搜索、景点、路况、路线、距离矩阵 |
 | 出行推荐 | 已完成 | 综合距离、城市地铁、高峰时段和用户偏好推荐交通方式 |
 | 景点指南 RAG 检索 | 已完成 | 指南 JSON 清洗 → 切分 → 阿里云嵌入向量化 → Milvus + VSM 混合检索 → 重排 → LLM 生成 |
 | 行程护航（定时监控） | 已完成 | 注册监控 → 定时巡检 → LLM 判断规则 → 触发时微信主动推送告警 |
-| 行程数据模型 | 进行中 | `Route` / `Itinerary` / `DayPlan` / `Spot` 已定义，完整行程生成流程尚未接入 |
-| 测试 | 已完成 | 当前 42 个测试用例全部通过，覆盖工具执行、路况、交通推荐、RAG 检索与行程护航 |
+| 行程数据模型 | 已完成 | `Route` / `Itinerary` / `DayPlan` / `Spot` 等模型已定义，旅行规划 Skill 产出结构化行程单（含状态与预算明细） |
+| 测试 | 已完成 | 当前 69 个测试用例全部通过，覆盖工具执行、路况、交通推荐、RAG 检索、行程护航与行程规划 |
 
 ## 快速开始
 
@@ -117,8 +117,10 @@ mvn spring-boot:run
 | Function Calling | 模型可自动调用已注册工具，支持一轮多工具并行或串行执行 |
 <<<<<<< Updated upstream
 | Skill 技能 | 关键词命中的技能直接执行，不依赖模型自行判断；已内置“旅行规划”“行程护航”技能，可继续添加 |
-| 旅行规划 Skill | 命中明确的自驾旅行需求时，会串联路线、景点、距离和天气工具，生成适合直接发送的路书 |
-| 行程护航 | 发送“监控郑州天气，低于0度就提醒我”开启监控；机器人定时巡检，规则触发时主动推送告警；“查看监控”“取消监控”管理 |
+| 旅行规划 Skill | 命中明确的自驾旅行需求时，串联路线、景点、距离和天气工具，生成结构化行程单（含状态、预算明细）；支持“重新排”重规划 |
+| 行程护航 | 发送“监控郑州天气，低于0度就提醒我”开启监控（支持天气/路况/时间/预算）；机器人定时巡检，规则触发时主动推送告警；“查看监控”“取消监控”管理 |
+| 多轮对话记忆 | 按用户保留最近 6 条消息作为 LLM 上下文（仅内存，重启清空） |
+| 本地状态持久化 | 监控列表与行程单保存到 `~/.autotrip-state.json`，重启后自动恢复 |
 | 开发自测接口 | `/wechat/llm/chat` 等接口可在不登录微信时验证 LLM 和工具链路 |
 
 ## 消息处理流程
@@ -126,9 +128,9 @@ mvn spring-boot:run
 ```text
 微信消息（文本 / 已转写文字的语音）
   └─ chatOrGenerate()
-     ├─ 命中 Skill → 执行技能并直接返回
-     ├─ 模型请求调用工具 → 执行工具 → 多轮循环直到模型给出最终回复
-     └─ 模型未调用工具 → 联网搜索兜底 → 返回最终回复
+     ├─ ① 命中 Skill 关键词 → 执行技能并直接返回
+     ├─ ② 命中 RAG 关键词（大理/杭州/上海/长沙 + 景点类意图）→ 增强 Prompt → LLM 回复
+     └─ ③ 都没命中 → LLM 多轮工具调用（未调用工具时联网搜索兜底）→ 返回最终回复
 ```
 
 ## 使用注意事项
@@ -150,7 +152,8 @@ mvn spring-boot:run
 - 微信端询问大理 / 杭州 / 上海 / 长沙景点时模型会调用 `query_guide_rag`，链路含嵌入、检索、重排和 LLM 生成，回复会比普通消息慢几秒。
 - 行程护航监控保存在内存中，重启后清空；告警推送需要微信已登录且目标用户有有效会话上下文，推送失败只记日志。
 - 每条监控每次巡检消耗 1 次工具调用 + 1 次 LLM 判断（默认 30 分钟一轮，费用可忽略）；规则触发判断依赖 LLM，解析不出结果时按不触发处理（宁可不打扰）。
-- 预算类监控依赖行程规划功能，暂未开放；天气监控只支持具体城市，路况监控注册时请写成“城市 道路”格式。
+- 预算类监控需要先有行程单（发送“帮我规划三天杭州行程”生成）；天气监控只支持具体城市，路况监控注册时请写成“城市 道路”格式。
+- 监控列表与行程单持久化在 `~/.autotrip-state.json`（重启自动恢复）；对话记忆仅内存保存，重启清空。
 - 联网搜索和模型调用会产生 API 费用，长时间运行或高频测试前先确认额度。
 - REST 接口没有鉴权，只适合本机或内网开发调试，不要直接暴露到公网。
 - Windows 控制台中文乱码时，可用 Windows Terminal，或在启动前执行 `chcp 65001`。
@@ -180,6 +183,8 @@ mvn spring-boot:run
 | `rag.index.auto-build` | `true` | 启动时自动构建索引 |
 | `monitor.enabled` | `true` | 是否开启行程护航定时巡检 |
 | `monitor.check-interval-minutes` | `30` | 行程护航巡检间隔（分钟） |
+| `app.state-file` | `${user.home}/.autotrip-state.json` | 监控列表与行程单的持久化文件 |
+| `agent.memory-size` | `6` | 每个用户保留的最近对话条数（仅内存） |
 | `wechat.auto-login` | `true` | 启动时自动恢复登录态或打印二维码 |
 | `wechat.resume-file` | `${user.home}/.wechat-demo-resume.json` | 微信登录态保存位置 |
 | `logging.charset.console` | `UTF-8` | 控制台日志编码 |
@@ -359,7 +364,7 @@ public String execute(String userText, SkillContext ctx) throws Exception {
 mvn test
 ```
 
-当前测试覆盖 Spring 上下文加载、工具串行 / 并行执行、实时路况工具、交通出行推荐，RAG 的指南加载、清洗、切分、VSM 关键词检索、RRF 混合融合与本地重排兜底，以及行程护航的注册表隔离、触发裁判解析与技能命令路由，共 42 个用例，不需要真实 API Key。
+当前测试覆盖 Spring 上下文加载、工具串行 / 并行执行、实时路况工具、交通出行推荐，RAG 的指南加载、清洗、切分、VSM 关键词检索、RRF 混合融合与本地重排兜底，行程护航的注册表隔离、触发裁判解析与技能命令路由，以及旅行规划的解析兜底、行程单排版、重规划关键词与状态持久化，共 69 个用例，不需要真实 API Key。
 
 使用 Maven Wrapper 时执行：
 
@@ -373,10 +378,16 @@ mvn test
 src/main/java/com/group/autotrip/
 ├── DemoApplication.java         Spring Boot 启动类
 ├── agent/
-│   └── DashScopeService.java    LLM 对话、联网搜索、工具调用与多轮闭环
+│   ├── DashScopeService.java    LLM 对话、三级路由（Skill → RAG → LLM）、工具调用多轮闭环
+│   ├── ConversationMemory.java  多轮对话记忆（内存，按用户）
+│   ├── MonitorService.java      行程护航：监控注册表、定时巡检、LLM 触发判断、微信告警推送
+│   ├── TripPlanStore.java       按用户保存最新行程单
+│   └── StateStore.java          监控列表与行程单的本地 JSON 持久化
 ├── common/
 │   ├── FunctionTool.java        工具接口
 │   └── model/                   Route / Itinerary / DayPlan / Spot / RouteOption / TransportMode
+├── output/
+│   └── ItineraryOutput.java      行程单成品排版（从 Itinerary 渲染）
 ├── rag/
 │   ├── RagService.java          RAG 问答编排（query 向量化 → 混合检索 → 重排 → Prompt → LLM）
 │   ├── RagIndexer.java          建库编排（清洗 → 切分 → 向量化 → Milvus / VSM 索引）
@@ -392,9 +403,8 @@ src/main/java/com/group/autotrip/
 │   ├── SkillContext.java        Skill 执行上下文
 │   ├── SkillRegistry.java       Skill 注册表
 │   ├── SkillDispatcher.java     Skill 关键词调度器
-│   └── TripGuardSkill.java      行程护航技能（注册/查看/取消监控）
-├── monitor/
-│   └── MonitorService.java      行程护航：监控注册表、定时巡检、LLM 触发判断、微信告警推送
+│   ├── TripGuardSkill.java      行程护航技能（注册/查看/取消监控）
+│   └── TripPlanSkill.java       旅行规划技能（结构化行程单 + 重规划）
 ├── tools/
 │   ├── CustomTools.java         工具注册与分发
 │   ├── QueryWeatherTool.java    天气查询工具

@@ -10,7 +10,7 @@ import java.util.List;
  * @param waypoints   途经点列表
  * @param distanceKm  总里程（公里）
  * @param durationMin 预计耗时（分钟）
- * @param routeType   路线类型（高速 / 国道 / 省道）
+ * @param routeType   路线类型（高速 / 国道 / 省道 / 其他）
  */
 public record Route(
         String start,
@@ -18,7 +18,7 @@ public record Route(
         List<String> waypoints,
         double distanceKm,
         int durationMin,
-        String routeType) {
+        RouteKind routeType) {
 
     /** 空途经点列表兜底，避免调用方拿到 null */
     public Route {

@@ -2,7 +2,8 @@ package com.group.autotrip.skill;
 
 import com.group.autotrip.common.model.AlertType;
 import com.group.autotrip.common.model.MonitorTarget;
-import com.group.autotrip.monitor.MonitorService;
+import com.group.autotrip.agent.MonitorService;
+import com.group.autotrip.agent.TripPlanStore;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.BeansException;
 import org.springframework.beans.factory.ObjectProvider;
@@ -48,7 +49,7 @@ class TripGuardSkillTest {
 
     @Test
     void supportsMatchesGuardKeywords() {
-        TripGuardSkill skill = new TripGuardSkill(providerOf(new MonitorService(null, null, null)));
+        TripGuardSkill skill = new TripGuardSkill(providerOf(new MonitorService(null, null, null, null, null)), new TripPlanStore(null));
         assertTrue(skill.supports("帮我监控郑州天气"));
         assertTrue(skill.supports("行程护航"));
         assertTrue(skill.supports("低于0度提醒我"));
@@ -59,9 +60,9 @@ class TripGuardSkillTest {
 
     @Test
     void cancelCommandRemovesAllTargets() throws Exception {
-        MonitorService service = new MonitorService(null, null, null);
+        MonitorService service = new MonitorService(null, null, null, null, null);
         service.add("u1", new MonitorTarget("郑州天气", AlertType.WEATHER, "郑州", "低于0度"));
-        TripGuardSkill skill = new TripGuardSkill(providerOf(service));
+        TripGuardSkill skill = new TripGuardSkill(providerOf(service), new TripPlanStore(null));
 
         String reply = skill.execute("取消监控", new SkillContext("u1", "取消监控", null, null));
 
@@ -71,8 +72,8 @@ class TripGuardSkillTest {
 
     @Test
     void cancelWithNoTargetsReportsEmpty() throws Exception {
-        MonitorService service = new MonitorService(null, null, null);
-        TripGuardSkill skill = new TripGuardSkill(providerOf(service));
+        MonitorService service = new MonitorService(null, null, null, null, null);
+        TripGuardSkill skill = new TripGuardSkill(providerOf(service), new TripPlanStore(null));
 
         String reply = skill.execute("取消监控", new SkillContext("u1", "取消监控", null, null));
 
@@ -81,9 +82,9 @@ class TripGuardSkillTest {
 
     @Test
     void listCommandShowsTargetsWithTypeAndRule() throws Exception {
-        MonitorService service = new MonitorService(null, null, null);
+        MonitorService service = new MonitorService(null, null, null, null, null);
         service.add("u1", new MonitorTarget("郑州天气", AlertType.WEATHER, "郑州", "低于0度提醒"));
-        TripGuardSkill skill = new TripGuardSkill(providerOf(service));
+        TripGuardSkill skill = new TripGuardSkill(providerOf(service), new TripPlanStore(null));
 
         String reply = skill.execute("查看监控", new SkillContext("u1", "查看监控", null, null));
 
@@ -94,7 +95,7 @@ class TripGuardSkillTest {
 
     @Test
     void listWithNoTargetsShowsUsageHint() throws Exception {
-        TripGuardSkill skill = new TripGuardSkill(providerOf(new MonitorService(null, null, null)));
+        TripGuardSkill skill = new TripGuardSkill(providerOf(new MonitorService(null, null, null, null, null)), new TripPlanStore(null));
 
         String reply = skill.execute("查看监控", new SkillContext("u1", "查看监控", null, null));
 

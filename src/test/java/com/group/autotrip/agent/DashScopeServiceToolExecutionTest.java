@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.group.autotrip.common.FunctionTool;
+import com.group.autotrip.rag.RagRouter;
 import com.group.autotrip.skill.SkillDispatcher;
 import com.group.autotrip.skill.SkillRegistry;
 import com.group.autotrip.tools.CustomTools;
@@ -75,7 +76,8 @@ class DashScopeServiceToolExecutionTest {
                 new SlowTool("tool_a", active, maxConcurrent),
                 new SlowTool("tool_b", active, maxConcurrent)));
         DashScopeService service = new DashScopeService(
-                customTools, new SkillDispatcher(new SkillRegistry(List.of())), "parallel", 2);
+                customTools, new SkillDispatcher(new SkillRegistry(List.of())),
+                new ConversationMemory(6), new RagRouter(), null, "parallel", 2);
         try {
             List<String> results = service.executeTools(toolCalls());
             assertEquals(List.of("tool_a", "tool_b"), results);
@@ -93,7 +95,8 @@ class DashScopeServiceToolExecutionTest {
                 new SlowTool("tool_a", active, maxConcurrent),
                 new SlowTool("tool_b", active, maxConcurrent)));
         DashScopeService service = new DashScopeService(
-                customTools, new SkillDispatcher(new SkillRegistry(List.of())), "serial", 2);
+                customTools, new SkillDispatcher(new SkillRegistry(List.of())),
+                new ConversationMemory(6), new RagRouter(), null, "serial", 2);
         try {
             List<String> results = service.executeTools(toolCalls());
             assertEquals(List.of("tool_a", "tool_b"), results);

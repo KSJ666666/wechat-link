@@ -1,8 +1,12 @@
-package com.group.autotrip.monitor;
+package com.group.autotrip.agent;
 
 import com.group.autotrip.common.model.AlertType;
+import com.group.autotrip.common.model.BudgetItem;
+import com.group.autotrip.common.model.Itinerary;
 import com.group.autotrip.common.model.MonitorTarget;
 import org.junit.jupiter.api.Test;
+
+import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -14,7 +18,7 @@ class MonitorServiceTest {
 
     /** 注册表操作不依赖外部服务，构造时传空依赖即可 */
     private static MonitorService newService() {
-        return new MonitorService(null, null, null);
+        return new MonitorService(null, null, null, null, null);
     }
 
     private static MonitorTarget weather(String name) {
@@ -78,5 +82,17 @@ class MonitorServiceTest {
                 MonitorService.parseCityAndRoad("郑州、北四环中路"));
         assertNull(MonitorService.parseCityAndRoad("郑州"));
         assertNull(MonitorService.parseCityAndRoad(null));
+    }
+
+    @Test
+    void budgetSummaryFormatsTotalAndItems() {
+        Itinerary itinerary = new Itinerary(
+                "杭州三日游", null, List.of(), 3000, List.of(), null,
+                List.of(new BudgetItem("住宿", 1500, "两晚"), new BudgetItem("门票", 600, "")));
+        String summary = MonitorService.budgetSummary(itinerary);
+        assertTrue(summary.contains("总预算 3000 元"));
+        assertTrue(summary.contains("住宿 1500 元"));
+        assertTrue(summary.contains("门票 600 元"));
+        assertTrue(summary.contains("杭州三日游"));
     }
 }

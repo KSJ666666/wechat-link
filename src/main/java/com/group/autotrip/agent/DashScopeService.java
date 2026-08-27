@@ -8,6 +8,9 @@ import com.group.autotrip.skill.SkillContext;
 import com.group.autotrip.skill.SkillDispatcher;
 import com.group.autotrip.tools.CustomTools;
 import com.group.autotrip.common.FunctionTool;
+import com.group.autotrip.rag.RagRouter;
+import com.group.autotrip.rag.RagService;
+import com.group.autotrip.rag.model.RagAnswer;
 import jakarta.annotation.PreDestroy;
 import okhttp3.MediaType;
 import okhttp3.OkHttpClient;
@@ -16,6 +19,7 @@ import okhttp3.RequestBody;
 import okhttp3.Response;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
@@ -53,15 +57,24 @@ public class DashScopeService {
 
     private final CustomTools customTools;
     private final SkillDispatcher skillDispatcher;
+    private final ConversationMemory conversationMemory;
+    private final RagRouter ragRouter;
+    private final ObjectProvider<RagService> ragServiceProvider;
     private final ExecutorService toolExecutor;
 
     public DashScopeService(
             CustomTools customTools,
             SkillDispatcher skillDispatcher,
+            ConversationMemory conversationMemory,
+            RagRouter ragRouter,
+            ObjectProvider<RagService> ragServiceProvider,
             @Value("${dashscope.tool-execution-mode:parallel}") String toolExecutionMode,
             @Value("${dashscope.tool-execution-threads:4}") int toolExecutionThreads) {
         this.customTools = customTools;
         this.skillDispatcher = skillDispatcher;
+        this.conversationMemory = conversationMemory;
+        this.ragRouter = ragRouter;
+        this.ragServiceProvider = ragServiceProvider;
         this.toolExecutor = "serial".equalsIgnoreCase(toolExecutionMode)
                 ? Executors.newSingleThreadExecutor()
                 : Executors.newFixedThreadPool(Math.max(1, toolExecutionThreads));
@@ -127,18 +140,46 @@ public class DashScopeService {
     public ChatResult chatOrGenerate(String userId, String userText) throws IOException {
         requireKey();
 
+        // ===== ① 命中 Skill 关键词 → Skill 执行 → 回复 =====
         Optional<String> skillReply = skillDispatcher.tryExecute(
                 new SkillContext(userId, userText, customTools, this));
         if (skillReply.isPresent()) {
-            return new ChatResult(skillReply.get());
+            String reply = skillReply.get();
+            conversationMemory.record(userId, userText, reply);
+            return new ChatResult(reply);
         }
+
+        // ===== ② 命中 RAG 关键词 → 增强 Prompt → LLM 回复 =====
+        String ragCity = ragRouter.match(userText);
+        if (!ragCity.isEmpty() && ragServiceProvider != null) {
+            try {
+                RagAnswer answer = ragServiceProvider.getObject().ask(userText, ragCity);
+                String reply = answer.sources().isEmpty() || answer.sourceTitles().isEmpty()
+                        ? answer.answer()
+                        : answer.answer() + "\n\n参考来源：" + answer.sourceTitles();
+                conversationMemory.record(userId, userText, reply);
+                return new ChatResult(reply);
+            } catch (Exception e) {
+                log.warn("RAG 路由回答失败，转 LLM 处理：{}", e.getMessage());
+            }
+        }
+
+        // ===== ③ 都没命中 → LLM（工具调用 + 多轮记忆） =====
+        ChatResult llmReply = chatOrGenerateLlm(userId, userText);
+        conversationMemory.record(userId, userText, llmReply.text());
+        return llmReply;
+    }
+
+    /** 路径③：只带工具、不联网搜索的 LLM 多轮闭环，附带多轮记忆上下文 */
+    private ChatResult chatOrGenerateLlm(String userId, String userText) throws IOException {
+        List<String> history = conversationMemory.recent(userId);
 
         // ===== 第一阶段：只带工具、不联网搜索 =====
         // 模型能用工具回答（天气或注册表工具）就走工具，全程不联网搜索。
         ObjectNode body = mapper.createObjectNode();
         body.put("model", chatModel);
         ArrayNode messages = body.putArray("messages");
-        addSystemAndUser(messages, userText);
+        addSystemAndUser(messages, userText, history);
         addTools(body);
         body.put("tool_choice", "auto");
 
@@ -154,7 +195,7 @@ public class DashScopeService {
                 searchBody.put("model", chatModel);
                 addSearchOptions(searchBody);
                 ArrayNode searchMessages = searchBody.putArray("messages");
-                addSystemAndUser(searchMessages, userText);
+                addSystemAndUser(searchMessages, userText, history);
                 JsonNode resp = postJson(CHAT_URL, searchBody);
                 String reply = resp.path("choices").path(0).path("message").path("content").asText("");
                 if (reply.isEmpty()) {
@@ -212,19 +253,23 @@ public class DashScopeService {
         return new ChatResult(finalReply);
     }
 
-    /** 组装 system + user 两条消息（工具优先的系统提示） */
-    private void addSystemAndUser(ArrayNode messages, String userText) {
+    /** 组装 system + user 两条消息（工具优先的系统提示，附带多轮对话记忆） */
+    private void addSystemAndUser(ArrayNode messages, String userText, List<String> history) {
         ObjectNode system = messages.addObject();
         system.put("role", "system");
-        system.put("content",
-                "你是微信机器人助手。当用户询问某个地点的实时/当前天气时，必须调用 query_weather 工具获取准确天气数据，"
-                        + "不要自己编造天气。"
-                        + toolRules()
-                        + "只要问题能通过上述工具解决，就必须调用对应工具，禁止直接凭训练知识回答或编造数据。"
-                        + "信息足够后必须直接生成最终回答，不要继续调用工具；同一轮内可以并行调用多个工具。"
-                        + "注意：如果用户询问的是省份、自治区等省级区域（如'河南天气'、'广东省天气'）的天气，不要调用 query_weather 工具，"
-                        + "而应提示用户：该查询仅支持具体城市，请提供具体的城市名称（如'郑州'、'广州'）。"
-                        + "其他无法用工具回答的问题，系统会自动联网搜索。");
+        String systemPrompt = "你是微信机器人助手。当用户询问某个地点的实时/当前天气时，必须调用 query_weather 工具获取准确天气数据，"
+                + "不要自己编造天气。"
+                + toolRules()
+                + "只要问题能通过上述工具解决，就必须调用对应工具，禁止直接凭训练知识回答或编造数据。"
+                + "信息足够后必须直接生成最终回答，不要继续调用工具；同一轮内可以并行调用多个工具。"
+                + "注意：如果用户询问的是省份、自治区等省级区域（如'河南天气'、'广东省天气'）的天气，不要调用 query_weather 工具，"
+                + "而应提示用户：该查询仅支持具体城市，请提供具体的城市名称（如'郑州'、'广州'）。"
+                + "其他无法用工具回答的问题，系统会自动联网搜索。";
+        if (history != null && !history.isEmpty()) {
+            systemPrompt += "\n\n以下是最近的对话记录（仅供参考上下文，以用户当前问题为准）：\n"
+                    + String.join("\n", history);
+        }
+        system.put("content", systemPrompt);
         ObjectNode user = messages.addObject();
         user.put("role", "user");
         user.put("content", userText);

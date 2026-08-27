@@ -1,9 +1,10 @@
-package com.group.autotrip.monitor;
+package com.group.autotrip.agent;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
-import com.group.autotrip.agent.DashScopeService;
 import com.group.autotrip.common.model.AlertType;
+import com.group.autotrip.common.model.BudgetItem;
+import com.group.autotrip.common.model.Itinerary;
 import com.group.autotrip.common.model.MonitorTarget;
 import com.group.autotrip.tools.CustomTools;
 import com.group.autotrip.wechat.WeChatService;
@@ -17,6 +18,7 @@ import org.springframework.stereotype.Service;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -44,6 +46,8 @@ public class MonitorService {
     private final CustomTools tools;
     private final DashScopeService llm;
     private final WeChatService weChat;
+    private final TripPlanStore tripPlanStore;
+    private final StateStore stateStore;
 
     /** userId（null 归入空串桶）→ 该用户的监控列表 */
     private final Map<String, List<MonitorTarget>> targetsByUser = new ConcurrentHashMap<>();
@@ -55,10 +59,13 @@ public class MonitorService {
     @Value("${monitor.check-interval-minutes:30}")
     private int checkIntervalMinutes;
 
-    public MonitorService(CustomTools tools, DashScopeService llm, WeChatService weChat) {
+    public MonitorService(CustomTools tools, DashScopeService llm, WeChatService weChat,
+                          TripPlanStore tripPlanStore, StateStore stateStore) {
         this.tools = tools;
         this.llm = llm;
         this.weChat = weChat;
+        this.tripPlanStore = tripPlanStore;
+        this.stateStore = stateStore;
     }
 
     // ===== 注册表 =====
@@ -72,13 +79,18 @@ public class MonitorService {
             return false;
         }
         list.add(target);
+        persist();
         return true;
     }
 
     /** 清空某用户的全部监控，返回删除条数 */
     public synchronized int removeAll(String userId) {
         List<MonitorTarget> removed = targetsByUser.remove(keyOf(userId));
-        return removed == null ? 0 : removed.size();
+        int count = removed == null ? 0 : removed.size();
+        if (count > 0) {
+            persist();
+        }
+        return count;
     }
 
     /** 某用户当前监控列表（按注册顺序） */
@@ -91,10 +103,32 @@ public class MonitorService {
         return targetsByUser.values().stream().mapToInt(List::size).sum();
     }
 
+    /** 全部监控目标快照（供持久化） */
+    public Map<String, List<MonitorTarget>> allTargets() {
+        Map<String, List<MonitorTarget>> snapshot = new LinkedHashMap<>();
+        targetsByUser.forEach((user, targets) -> snapshot.put(user, List.copyOf(targets)));
+        return snapshot;
+    }
+
+    private void persist() {
+        if (stateStore != null) {
+            stateStore.saveMonitors(allTargets());
+        }
+    }
+
     // ===== 定时巡检 =====
 
     @PostConstruct
     void start() {
+        // 从本地状态文件恢复监控列表
+        if (stateStore != null) {
+            Map<String, List<MonitorTarget>> saved = stateStore.load().monitors();
+            if (saved != null && !saved.isEmpty()) {
+                targetsByUser.putAll(saved);
+                log.info("已从状态文件恢复 {} 条监控",
+                        saved.values().stream().mapToInt(List::size).sum());
+            }
+        }
         if (!enabled) {
             log.info("行程护航已关闭（monitor.enabled=false）");
             return;
@@ -143,9 +177,9 @@ public class MonitorService {
     }
 
     private void checkOne(String userId, MonitorTarget target) throws Exception {
-        String data = collectData(target);
+        String data = collectData(userId, target);
         if (data == null) {
-            return; // 本期不支持的类型（如 BUDGET）静默跳过
+            return; // 取不到数据（如 BUDGET 且无行程单）静默跳过
         }
         if (!judge(target.rule(), data)) {
             log.debug("监控未触发：{}，数据：{}", target.name(), data);
@@ -156,8 +190,8 @@ public class MonitorService {
         pushAlert(userId, target, data);
     }
 
-    /** 按监控类型取当前数据；返回 null 表示该类型本期不巡检 */
-    private String collectData(MonitorTarget target) throws Exception {
+    /** 按监控类型取当前数据；返回 null 表示当前取不到数据（静默跳过） */
+    private String collectData(String userId, MonitorTarget target) throws Exception {
         return switch (target.type()) {
             case WEATHER -> {
                 ObjectNode args = MAPPER.createObjectNode();
@@ -176,8 +210,37 @@ public class MonitorService {
                 yield tools.execute("query_traffic", args);
             }
             case TIME, OTHER -> "时刻：" + LocalDateTime.now().format(TIME_FORMAT);
+            case BUDGET -> {
+                Itinerary itinerary = tripPlanStore == null ? null : tripPlanStore.get(userId);
+                yield itinerary == null ? null : budgetSummary(itinerary);
+            }
             default -> null;
         };
+    }
+
+    /** 行程预算摘要（BUDGET 监控的数据源） */
+    static String budgetSummary(Itinerary itinerary) {
+        StringBuilder sb = new StringBuilder("行程“")
+                .append(itinerary.title() == null ? "" : itinerary.title())
+                .append("”预算：总预算 ").append(formatAmount(itinerary.budget())).append(" 元");
+        if (!itinerary.budgetItems().isEmpty()) {
+            sb.append("；明细：");
+            for (int i = 0; i < itinerary.budgetItems().size(); i++) {
+                BudgetItem item = itinerary.budgetItems().get(i);
+                if (i > 0) {
+                    sb.append("、");
+                }
+                sb.append(item.category()).append(" ").append(formatAmount(item.amount())).append(" 元");
+            }
+        }
+        return sb.toString();
+    }
+
+    private static String formatAmount(double amount) {
+        if (amount == Math.floor(amount) && !Double.isInfinite(amount)) {
+            return String.valueOf((long) amount);
+        }
+        return String.valueOf(amount);
     }
 
     /** LLM 裁判：规则 + 观测数据 → 是否触发 */

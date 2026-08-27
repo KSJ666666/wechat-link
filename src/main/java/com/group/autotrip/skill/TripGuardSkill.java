@@ -4,7 +4,8 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.group.autotrip.common.model.AlertType;
 import com.group.autotrip.common.model.MonitorTarget;
-import com.group.autotrip.monitor.MonitorService;
+import com.group.autotrip.agent.MonitorService;
+import com.group.autotrip.agent.TripPlanStore;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.ObjectProvider;
@@ -35,9 +36,11 @@ public class TripGuardSkill implements Skill {
     private static final List<String> BUDGET_HINTS = List.of("预算", "花费", "超支");
 
     private final ObjectProvider<MonitorService> monitorServiceProvider;
+    private final TripPlanStore tripPlanStore;
 
-    public TripGuardSkill(ObjectProvider<MonitorService> monitorServiceProvider) {
+    public TripGuardSkill(ObjectProvider<MonitorService> monitorServiceProvider, TripPlanStore tripPlanStore) {
         this.monitorServiceProvider = monitorServiceProvider;
+        this.tripPlanStore = tripPlanStore;
     }
 
     @Override
@@ -78,8 +81,8 @@ public class TripGuardSkill implements Skill {
             return "抱歉，没有从你的消息中解析出监控内容。\n"
                     + "示例：监控郑州天气，温度低于0度就提醒我。";
         }
-        if (target.type() == AlertType.BUDGET) {
-            return "预算监控需要先创建行程（行程规划功能开发中），暂时还不支持哦。";
+        if (target.type() == AlertType.BUDGET && !tripPlanStore.has(userId)) {
+            return "预算监控需要先创建行程。先发送“帮我规划三天杭州行程”生成行程单，再来开启预算监控。";
         }
         if (target.rule().isBlank()) {
             target = new MonitorTarget(target.name(), target.type(), target.keyword(), "每次检查都提醒");
