@@ -18,6 +18,7 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.EnumMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.Semaphore;
 import java.util.stream.Collectors;
@@ -40,7 +41,10 @@ public class AmapService {
     private static final Logger log = LoggerFactory.getLogger(AmapService.class);
 
     private static final String POI_TEXT_URL = "https://restapi.amap.com/v3/place/text";
-    private static final String TRAFFIC_ROAD_URL = "https://restapi.amap.com/v3/traffic/status/road";
+    /** 路况估算：走廊终点相对道路点的经度偏移（约 2 公里） */
+    private static final double CORRIDOR_OFFSET_DEG = 0.025;
+    /** 路况估算：走廊路线的最短有效距离（米），不足时反向重试 */
+    private static final long MIN_CORRIDOR_METERS = 1000;
     private static final String POI_DETAIL_URL = "https://restapi.amap.com/v3/place/detail";
     private static final String DRIVING_ROUTE_URL = "https://restapi.amap.com/v3/direction/driving";
     private static final String WALKING_ROUTE_URL = "https://restapi.amap.com/v3/direction/walking";
@@ -110,46 +114,73 @@ public class AmapService {
         return result;
     }
 
-    /** 查询指定城市某条道路的实时交通态势，city 可为城市名或 adcode。 */
+    /**
+     * 查询指定城市某条道路的实时通行状况（估算）。
+     *
+     * <p>高德“交通态势”接口为商务合作高级接口，本方法改用免费接口推算：
+     * 地理编码定位道路 → 沿道路走廊规划驾车路线 → 平均车速映射拥堵等级。
+     * city 可为城市名或 adcode。
+     */
     public TrafficInfo getRoadTraffic(String cityOrAdcode, String road, String level) throws IOException {
-        requireKey();
-        HttpUrl.Builder url = HttpUrl.get(TRAFFIC_ROAD_URL).newBuilder()
-                .addQueryParameter("key", apiKey)
-                .addQueryParameter("name", road);
-        if (!isBlank(cityOrAdcode)) {
-            if (cityOrAdcode.trim().matches("\\d{6}")) {
-                url.addQueryParameter("adcode", cityOrAdcode.trim());
-            } else {
-                url.addQueryParameter("city", cityOrAdcode.trim());
-            }
+        PoiInfo point;
+        try {
+            point = resolvePoi(road, cityOrAdcode);
+        } catch (PoiNotFoundException e) {
+            throw new PoiNotFoundException("未找到道路：" + road + "，请确认城市和道路名称");
         }
-        if (!isBlank(level)) {
-            url.addQueryParameter("level", level);
-        }
-        url.addQueryParameter("extensions", "all");
 
-        JsonNode resp = getJson(url.build().toString());
-        checkStatus(resp);
+        RouteOption route = corridorRoute(point);
+        double speedKmh = route.durationSeconds() <= 0 ? 0
+                : route.distanceMeters() / 1000.0 / (route.durationSeconds() / 3600.0);
+        String speedText = String.format(Locale.ROOT, "%.0f", speedKmh);
 
-        JsonNode traffic = resp.path("trafficinfo");
-        String status = traffic.path("status").asText("");
-        List<RoadTraffic> roads = new ArrayList<>();
-        JsonNode roadsNode = traffic.path("roads");
-        if (roadsNode.isArray()) {
-            for (JsonNode r : roadsNode) {
-                roads.add(new RoadTraffic(
-                        r.path("name").asText(""),
-                        statusText(r.path("status").asText("")),
-                        r.path("direction").asText(""),
-                        r.path("speed").asText(""),
-                        r.path("description").asText("")
-                ));
-            }
+        String statusText = statusBySpeed(speedKmh);
+        String description = "基于驾车通行速度估算（约 " + speedText
+                + " km/h，走廊距离 " + route.distanceMeters() + " 米）";
+        RoadTraffic roadTraffic = new RoadTraffic(road, statusText, "", speedText, "");
+        return new TrafficInfo(statusText, description, List.of(roadTraffic));
+    }
+
+    /** 沿道路走廊规划驾车路线：向东偏移约 2 公里，路线过短时改向西重试 */
+    private RouteOption corridorRoute(PoiInfo point) throws IOException {
+        RouteOption route = routeToOffset(point, CORRIDOR_OFFSET_DEG);
+        if (route.distanceMeters() < MIN_CORRIDOR_METERS) {
+            route = routeToOffset(point, -CORRIDOR_OFFSET_DEG);
         }
-        if (roads.isEmpty()) {
-            throw new IOException("未查询到该道路的实时路况");
+        return route;
+    }
+
+    private RouteOption routeToOffset(PoiInfo point, double lngOffset) throws IOException {
+        double[] lngLat = parseLngLat(point.location());
+        PoiInfo destination = new PoiInfo("", "道路走廊终点", "", "", point.city(), "", "",
+                (lngLat[0] + lngOffset) + "," + lngLat[1]);
+        return getDrivingRouteOption(point, destination);
+    }
+
+    /** “lng,lat”坐标解析，格式错误时抛出异常 */
+    private static double[] parseLngLat(String location) throws IOException {
+        if (location == null || !location.contains(",")) {
+            throw new IOException("道路坐标解析失败：" + location);
         }
-        return new TrafficInfo(statusText(status), traffic.path("description").asText(""), roads);
+        String[] parts = location.split(",");
+        return new double[]{Double.parseDouble(parts[0].trim()), Double.parseDouble(parts[1].trim())};
+    }
+
+    /** 平均车速（km/h）映射拥堵等级 */
+    static String statusBySpeed(double speedKmh) {
+        if (speedKmh <= 0) {
+            return "未知";
+        }
+        if (speedKmh < 6) {
+            return "严重拥堵";
+        }
+        if (speedKmh < 12) {
+            return "拥堵";
+        }
+        if (speedKmh < 22) {
+            return "缓行";
+        }
+        return "畅通";
     }
 
     /** 查询单个景点详情（评分、等级、开放时间等）。 */
@@ -528,16 +559,6 @@ public class AmapService {
         return value == null || value.isBlank();
     }
 
-    private static String statusText(String code) {
-        return switch (code) {
-            case "1" -> "畅通";
-            case "2" -> "缓行";
-            case "3" -> "拥堵";
-            case "4" -> "严重拥堵";
-            default -> "未知";
-        };
-    }
-
     private void checkStatus(JsonNode resp) throws IOException {
         if (!"1".equals(resp.path("status").asText())) {
             String code = resp.path("infocode").asText("");
@@ -642,11 +663,11 @@ public class AmapService {
         }
     }
 
-    /** 道路交通态势 */
+    /** 道路交通通行状况（估算） */
     public record TrafficInfo(String statusText, String description, List<RoadTraffic> roads) {
         @Override
         public String toString() {
-            StringBuilder sb = new StringBuilder("交通态势：").append(statusText);
+            StringBuilder sb = new StringBuilder("路况：").append(statusText);
             if (!description.isBlank()) {
                 sb.append("。").append(description);
             }
