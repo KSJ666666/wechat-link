@@ -41,6 +41,12 @@ build/
 .wechat-demo-resume.json
 .autotrip-state.json
 
+### 密钥与本地环境配置 ###
+.env
+.env.*
+application-local.properties
+application-local.yml
+
 ### 系统文件 ###
 .DS_Store
 Thumbs.db
